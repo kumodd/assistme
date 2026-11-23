@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.RecorderApp" parent="android:Theme.Material.NoActionBar" />
+</resources>

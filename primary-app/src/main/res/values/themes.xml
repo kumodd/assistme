@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.PrimaryAi" parent="android:Theme.Material.NoActionBar" />
+</resources>

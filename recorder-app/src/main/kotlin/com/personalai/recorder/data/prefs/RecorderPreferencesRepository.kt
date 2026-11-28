@@ -31,6 +31,7 @@ data class RecorderAppSettings(
     val onboardingCompleted: Boolean = false,
     val privacyKillSwitch: Boolean = false,
     val autoDeleteSyncedSegments: Boolean = false,
+    val bleHostDesired: Boolean = true,
     val config: RecorderConfigPayload = RecorderConfigPayload()
 )
 
@@ -42,6 +43,7 @@ class RecorderPreferencesRepository @Inject constructor(
         val ONBOARDING_COMPLETED = booleanPreferencesKey("onboarding_completed")
         val PRIVACY_KILL_SWITCH = booleanPreferencesKey("privacy_kill_switch")
         val AUTO_DELETE_SYNCED = booleanPreferencesKey("auto_delete_synced")
+        val BLE_HOST_DESIRED = booleanPreferencesKey("ble_host_desired")
 
         val VAD_THRESHOLD = floatPreferencesKey("vad_threshold")
         val PRE_ROLL_MS = intPreferencesKey("pre_roll_ms")
@@ -68,12 +70,13 @@ class RecorderPreferencesRepository @Inject constructor(
             onboardingCompleted = prefs[Keys.ONBOARDING_COMPLETED] ?: false,
             privacyKillSwitch = prefs[Keys.PRIVACY_KILL_SWITCH] ?: false,
             autoDeleteSyncedSegments = prefs[Keys.AUTO_DELETE_SYNCED] ?: false,
+            bleHostDesired = prefs[Keys.BLE_HOST_DESIRED] ?: true,
             config = RecorderConfigPayload(
                 vadThreshold = prefs[Keys.VAD_THRESHOLD] ?: 0.50f,
-                preRollMs = prefs[Keys.PRE_ROLL_MS] ?: 500,
-                silenceTimeoutMs = prefs[Keys.SILENCE_TIMEOUT_MS] ?: 1_200,
-                maxSegmentDurationMs = prefs[Keys.MAX_SEGMENT_MS] ?: 30_000,
-                minSpeechDurationMs = prefs[Keys.MIN_SPEECH_MS] ?: 400,
+                preRollMs = prefs[Keys.PRE_ROLL_MS] ?: 640,
+                silenceTimeoutMs = prefs[Keys.SILENCE_TIMEOUT_MS] ?: 1_600,
+                maxSegmentDurationMs = prefs[Keys.MAX_SEGMENT_MS] ?: 45_000,
+                minSpeechDurationMs = prefs[Keys.MIN_SPEECH_MS] ?: 800,
                 audioSource = audioSource,
                 minFreeStorageMb = prefs[Keys.MIN_FREE_STORAGE_MB] ?: 250L,
                 minBatteryPctToRecord = prefs[Keys.MIN_BATTERY_PCT] ?: 8,
@@ -92,6 +95,10 @@ class RecorderPreferencesRepository @Inject constructor(
 
     suspend fun setAutoDeleteSynced(enabled: Boolean) {
         context.recorderDataStore.edit { it[Keys.AUTO_DELETE_SYNCED] = enabled }
+    }
+
+    suspend fun setBleHostDesired(desired: Boolean) {
+        context.recorderDataStore.edit { it[Keys.BLE_HOST_DESIRED] = desired }
     }
 
     suspend fun updateConfig(config: RecorderConfigPayload) {

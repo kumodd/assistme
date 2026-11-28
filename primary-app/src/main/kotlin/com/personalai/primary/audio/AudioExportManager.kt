@@ -14,6 +14,7 @@ import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -34,57 +35,66 @@ class AudioExportManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val audioStorage: PrimaryEncryptedAudioStorage
 ) {
+    private val activeExports = ConcurrentHashMap.newKeySet<String>()
+
+    fun isExporting(segmentId: String): Boolean = activeExports.contains(segmentId)
+
     suspend fun downloadChunkToDevice(segment: SyncedSegmentEntity): Result<ExportedAudioResult> =
         withContext(Dispatchers.IO) {
-            runCatching {
-                if (segment.audioDeleted || !audioStorage.hasEncryptedAudio(segment.localEncryptedAudioPath)) {
-                    throw IllegalStateException("Audio chunk #${segment.sequenceNumber} was already pruned to save space (transcript is still saved).")
-                }
-
-                val wavBytes = audioStorage.decryptWavBytes(
-                    relativePath = segment.localEncryptedAudioPath,
-                    sessionId = segment.sessionId,
-                    segmentId = segment.segmentId
-                )
-
-                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
-                    .format(Date(segment.startTimestampMs))
-                val fileName = "SecondMind_seg${segment.sequenceNumber}_${stamp}.wav"
-                val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/SecondMind"
-
-                val resolver = context.contentResolver
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                    put(MediaStore.Downloads.MIME_TYPE, "audio/wav")
-                    put(MediaStore.Downloads.RELATIVE_PATH, relativePath)
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                    ?: throw IllegalStateException("Unable to create file in Downloads/SecondMind.")
-
-                try {
-                    resolver.openOutputStream(uri)?.use { out ->
-                        out.write(wavBytes)
-                        out.flush()
-                    } ?: throw IllegalStateException("Unable to open output stream for $fileName.")
-
-                    val doneValues = ContentValues().apply {
-                        put(MediaStore.Downloads.IS_PENDING, 0)
+            activeExports.add(segment.segmentId)
+            try {
+                runCatching {
+                    if (segment.audioDeleted || !audioStorage.hasEncryptedAudio(segment.localEncryptedAudioPath)) {
+                        throw IllegalStateException("Audio chunk #${segment.sequenceNumber} was already pruned to save space (transcript is still saved).")
                     }
-                    resolver.update(uri, doneValues, null, null)
-                } catch (t: Throwable) {
-                    runCatching { resolver.delete(uri, null, null) }
-                    throw t
-                }
 
-                ExportedAudioResult(
-                    segmentId = segment.segmentId,
-                    fileName = fileName,
-                    relativeFolder = "Downloads/SecondMind",
-                    contentUri = uri,
-                    sizeBytes = wavBytes.size.toLong()
-                )
+                    val wavBytes = audioStorage.decryptWavBytes(
+                        relativePath = segment.localEncryptedAudioPath,
+                        sessionId = segment.sessionId,
+                        segmentId = segment.segmentId
+                    )
+
+                    val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+                        .format(Date(segment.startTimestampMs))
+                    val fileName = "Sunbo_seg${segment.sequenceNumber}_${stamp}.wav"
+                    val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/Sunbo"
+
+                    val resolver = context.contentResolver
+                    val values = ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                        put(MediaStore.Downloads.MIME_TYPE, "audio/wav")
+                        put(MediaStore.Downloads.RELATIVE_PATH, relativePath)
+                        put(MediaStore.Downloads.IS_PENDING, 1)
+                    }
+
+                    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IllegalStateException("Unable to create file in Downloads/Sunbo.")
+
+                    try {
+                        resolver.openOutputStream(uri)?.use { out ->
+                            out.write(wavBytes)
+                            out.flush()
+                        } ?: throw IllegalStateException("Unable to open output stream for $fileName.")
+
+                        val doneValues = ContentValues().apply {
+                            put(MediaStore.Downloads.IS_PENDING, 0)
+                        }
+                        resolver.update(uri, doneValues, null, null)
+                    } catch (t: Throwable) {
+                        runCatching { resolver.delete(uri, null, null) }
+                        throw t
+                    }
+
+                    ExportedAudioResult(
+                        segmentId = segment.segmentId,
+                        fileName = fileName,
+                        relativeFolder = "Downloads/Sunbo",
+                        contentUri = uri,
+                        sizeBytes = wavBytes.size.toLong()
+                    )
+                }
+            } finally {
+                activeExports.remove(segment.segmentId)
             }
         }
 

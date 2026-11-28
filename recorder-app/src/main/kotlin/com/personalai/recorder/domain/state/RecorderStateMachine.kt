@@ -1,5 +1,6 @@
 package com.personalai.recorder.domain.state
 
+import android.os.SystemClock
 import com.personalai.protocol.BleConnectionState
 import com.personalai.protocol.RecorderState
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -8,6 +9,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import javax.inject.Inject
 import javax.inject.Singleton
+
+data class LiveMeterSnapshot(
+    val audioLevelDb: Float = -90f,
+    val vadProbability: Float = 0f,
+    val activeSegmentDurationMs: Long = 0L
+)
 
 data class RecorderSnapshot(
     val recorderState: RecorderState = RecorderState.UNCONFIGURED,
@@ -52,11 +59,19 @@ class RecorderStateMachine @Inject constructor() {
     private val _snapshot = MutableStateFlow(RecorderSnapshot())
     val snapshot: StateFlow<RecorderSnapshot> = _snapshot.asStateFlow()
 
+    // High-frequency live meter values (~10 Hz throttled) kept strictly separate from structural
+    // RecorderSnapshot so 31 Hz audio frames never trigger full-screen Compose recompositions or
+    // starve BLE status debounce windows.
+    private val _liveMeter = MutableStateFlow(LiveMeterSnapshot())
+    val liveMeter: StateFlow<LiveMeterSnapshot> = _liveMeter.asStateFlow()
+
     // Bluetooth state is strictly independent and never changes recorderState.
     private val _bleState = MutableStateFlow(BleConnectionState.DISCONNECTED)
     val bleState: StateFlow<BleConnectionState> = _bleState.asStateFlow()
 
     private val lock = Any()
+    @Volatile
+    private var lastMeterUpdateMs: Long = 0L
 
     fun updateBleState(newState: BleConnectionState) = synchronized(lock) {
         _bleState.value = newState
@@ -69,14 +84,25 @@ class RecorderStateMachine @Inject constructor() {
         inputDeviceName: String,
         activeSegmentDurationMs: Long? = null
     ) {
-        _snapshot.update { current ->
-            current.copy(
-                audioLevelDb = audioLevelDb,
-                vadProbability = vadProbability,
-                inputDeviceName = inputDeviceName,
-                activeSegmentDurationMs = activeSegmentDurationMs ?: current.activeSegmentDurationMs
-            )
+        if (_snapshot.value.inputDeviceName != inputDeviceName) {
+            _snapshot.update { it.copy(inputDeviceName = inputDeviceName) }
         }
+        val now = runCatching { SystemClock.elapsedRealtime() }.getOrElse { System.currentTimeMillis() }
+        if (now - lastMeterUpdateMs >= 90L) {
+            lastMeterUpdateMs = now
+            _liveMeter.update { current ->
+                current.copy(
+                    audioLevelDb = audioLevelDb,
+                    vadProbability = vadProbability,
+                    activeSegmentDurationMs = activeSegmentDurationMs ?: current.activeSegmentDurationMs
+                )
+            }
+        }
+    }
+
+    fun resetLiveMeter() {
+        lastMeterUpdateMs = 0L
+        _liveMeter.value = LiveMeterSnapshot()
     }
 
     fun incrementSessionSegments() {

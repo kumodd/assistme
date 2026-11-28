@@ -12,8 +12,18 @@ object UoaiConstants {
     const val BASE_URL = "http://127.0.0.1:8765/v1"
     const val MODEL_AUTO = "auto"
     const val MAX_REQUEST_BYTES = 2_097_152 // 2 MiB
+    const val MAX_AUDIO_UPLOAD_BYTES = 26_214_400L // 25 MiB
+    const val MAX_AUDIO_DURATION_SEC = 600 // 10 minutes
     const val HARD_MAX_TOKENS = 32_768
     const val GENERATION_TIMEOUT_MS = 300_000L // 300 s
+    const val AUDIO_TIMEOUT_MS = 180_000L // 180 s default
+    const val AUDIO_PROVIDER_AUTO = "auto"
+    const val AUDIO_PROVIDER_GEMMA4 = "gemma4"
+    const val AUDIO_PROVIDER_WHISPER = "whisper"
+    const val AUDIO_PROVIDER_CACTUS = "cactus"
+    const val AUDIO_MODEL_GEMMA4 = "gemma-4"
+    const val AUDIO_MODEL_WHISPER = "whisper-1"
+    const val AUDIO_MODEL_CACTUS = "akshar-v4"
     const val EXTRA_TOKEN = "token"
     const val EXTRA_CLIENT_ID = "client_id"
     const val EXTRA_ERROR_CODE = "error_code"
@@ -62,6 +72,166 @@ data class UoaiCapabilities(
     val supportsStreaming: Boolean get() = "streaming" in features
     val supportsCancellation: Boolean get() = "cancellation" in features
     val supportsToolCalling: Boolean get() = "tool-calling" in features
+    val supportsGemma4Audio: Boolean get() = "gemma4-audio" in features
+    val supportsAsr: Boolean get() = "asr" in features || "gemma4-audio" in features
+    val supportsExternalInference: Boolean get() = "external-inference" in features
+}
+
+// ---------- UOAI Audio & External Inference DTOs (/v1/audio/*) ----------
+
+@Serializable
+data class UoaiAudioStatusResponse(
+    @SerialName("gemma4_audio_ready") val gemma4AudioReady: Boolean = false,
+    @SerialName("preferred_provider") val preferredProvider: String = UoaiConstants.AUDIO_PROVIDER_GEMMA4,
+    @SerialName("external_providers_count") val externalProvidersCount: Int = 0,
+    val state: String? = null,
+    val status: String? = null,
+    @SerialName("active_model") val activeModel: String? = null,
+    @SerialName("whisper_loaded") val whisperLoaded: Boolean = false,
+    @SerialName("model_loaded") val modelLoaded: Boolean = false,
+    @SerialName("queue_depth") val queueDepth: Int = 0,
+    @SerialName("max_upload_bytes") val maxUploadBytes: Long = UoaiConstants.MAX_AUDIO_UPLOAD_BYTES,
+    @SerialName("max_audio_duration_sec") val maxAudioDurationSec: Int = UoaiConstants.MAX_AUDIO_DURATION_SEC
+)
+
+@Serializable
+data class UoaiAudioProviderInfo(
+    val id: String = "",
+    val name: String = "",
+    val kind: String = "",
+    val builtin: Boolean = true,
+    val enabled: Boolean = true,
+    val ready: Boolean = false,
+    val recommended: Boolean = false,
+    @SerialName("default_model") val defaultModel: String? = null,
+    val models: List<String> = emptyList(),
+    @SerialName("supports_streaming") val supportsStreaming: Boolean = false,
+    @SerialName("base_url") val baseUrl: String? = null,
+    @SerialName("has_api_key") val hasApiKey: Boolean = false,
+    val note: String? = null
+)
+
+@Serializable
+data class UoaiAudioProvidersResponse(
+    val `object`: String = "list",
+    @SerialName("preferred_provider") val preferredProvider: String = UoaiConstants.AUDIO_PROVIDER_GEMMA4,
+    val data: List<UoaiAudioProviderInfo> = emptyList()
+)
+
+@Serializable
+data class UoaiAudioModelInfo(
+    val id: String = "",
+    val name: String = "",
+    val provider: String = "",
+    @SerialName("engine_type") val engineType: String = "",
+    val ready: Boolean = false,
+    val installed: Boolean = false,
+    @SerialName("size_bytes") val sizeBytes: Long = 0L
+)
+
+@Serializable
+data class UoaiAudioModelsResponse(
+    val `object`: String = "list",
+    val data: List<UoaiAudioModelInfo> = emptyList()
+)
+
+@Serializable
+data class UoaiAudioSegment(
+    val id: Int = 0,
+    val start: Double = 0.0,
+    val end: Double = 0.0,
+    val text: String = "",
+    @SerialName("avg_logprob") val avgLogProb: Float? = null,
+    @SerialName("no_speech_prob") val noSpeechProb: Float? = null
+)
+
+@Serializable
+data class UoaiAudioTranscriptionResponse(
+    val id: String = "",
+    val task: String? = null,
+    val text: String = "",
+    val model: String = "",
+    val language: String? = null,
+    val duration: Double? = null,
+    val segments: List<UoaiAudioSegment> = emptyList(),
+    @SerialName("elapsed_ms") val elapsedMs: Long? = null,
+    val provider: String? = null,
+    @SerialName("roman_hinglish") val romanHinglish: String? = null,
+    @SerialName("devanagari_hinglish") val devanagariHinglish: String? = null
+)
+
+@Serializable
+data class UoaiAudioLoadRequest(
+    val model: String
+)
+
+@Serializable
+data class UoaiAudioUnloadRequest(
+    val force: Boolean = false
+)
+
+@Serializable
+private data class UoaiAudioStreamPayload(
+    val id: String = "",
+    val `object`: String = "",
+    val model: String = "",
+    val language: String? = null,
+    val provider: String? = null,
+    val index: Int = 0,
+    val start: Double = 0.0,
+    val end: Double = 0.0,
+    val duration: Double? = null,
+    val text: String = "",
+    @SerialName("is_final") val isFinal: Boolean = false,
+    @SerialName("finish_reason") val finishReason: String? = null,
+    val error: UoaiErrorBody? = null
+)
+
+data class UoaiAudioTranscriptionParams(
+    val provider: String = UoaiConstants.AUDIO_PROVIDER_GEMMA4,
+    val model: String? = null,
+    val language: String? = null,
+    val prompt: String? = null,
+    val script: String? = null,
+    val responseFormat: String = "verbose_json",
+    val temperature: Float = 0.0f,
+    val translate: Boolean = false,
+    val timestamps: Boolean = true
+)
+
+sealed interface UoaiAudioStreamEvent {
+    data class Started(
+        val id: String,
+        val model: String,
+        val language: String?,
+        val provider: String?
+    ) : UoaiAudioStreamEvent
+
+    data class Segment(
+        val id: String,
+        val index: Int,
+        val start: Double,
+        val end: Double,
+        val text: String,
+        val language: String?,
+        val isFinal: Boolean,
+        val provider: String?
+    ) : UoaiAudioStreamEvent
+
+    data class Completed(
+        val id: String,
+        val model: String,
+        val language: String?,
+        val duration: Double?,
+        val text: String,
+        val finishReason: String?,
+        val provider: String?
+    ) : UoaiAudioStreamEvent
+
+    data object Done : UoaiAudioStreamEvent
+    data object Cancelled : UoaiAudioStreamEvent
+    data class StreamError(val code: String?, val message: String) : UoaiAudioStreamEvent
+    data object Ignore : UoaiAudioStreamEvent
 }
 
 @Serializable
@@ -206,6 +376,8 @@ sealed class UoaiException(
         UoaiException(message, errorCode = code, httpStatus = 503)
     class RequestCancelled(message: String = "Generation cancelled.") :
         UoaiException(message, errorCode = "request_cancelled", httpStatus = 409)
+    class TransientBusy(message: String, code: String? = null, status: Int? = null) :
+        UoaiException(message, errorCode = code, httpStatus = status)
     class ApiError(message: String, code: String? = null, status: Int? = null) :
         UoaiException(message, errorCode = code, httpStatus = status)
 }
@@ -293,6 +465,83 @@ object UoaiProtocolHelpers {
             unfenced.substring(firstBrace, lastBrace + 1)
         } else {
             unfenced
+        }
+    }
+
+    /**
+     * Parses a single SSE line from `POST /v1/audio/stream`.
+     */
+    fun parseAudioSseLine(rawLine: String): UoaiAudioStreamEvent {
+        val trimmed = rawLine.trim()
+        if (trimmed.isEmpty() || !trimmed.startsWith("data:")) {
+            return UoaiAudioStreamEvent.Ignore
+        }
+        val payload = trimmed.removePrefix("data:").trim()
+        if (payload.isEmpty()) return UoaiAudioStreamEvent.Ignore
+        if (payload == "[DONE]") return UoaiAudioStreamEvent.Done
+
+        val obj = runCatching { json.decodeFromString<JsonObject>(payload) }.getOrNull()
+        if (obj != null && obj.containsKey("error")) {
+            val env = runCatching { json.decodeFromString<UoaiErrorEnvelope>(payload) }.getOrNull()
+            return UoaiAudioStreamEvent.StreamError(
+                code = env?.error?.code,
+                message = env?.error?.message ?: "Audio stream error from UOAI provider"
+            )
+        }
+
+        val parsed = runCatching { json.decodeFromString<UoaiAudioStreamPayload>(payload) }.getOrNull()
+            ?: return UoaiAudioStreamEvent.Ignore
+        if (parsed.error != null) {
+            return UoaiAudioStreamEvent.StreamError(parsed.error.code, parsed.error.message)
+        }
+        if (parsed.finishReason == "cancelled") {
+            return UoaiAudioStreamEvent.Cancelled
+        }
+        return when (parsed.`object`) {
+            "audio.transcription.start" -> UoaiAudioStreamEvent.Started(
+                id = parsed.id,
+                model = parsed.model,
+                language = parsed.language,
+                provider = parsed.provider
+            )
+            "audio.transcription.segment" -> UoaiAudioStreamEvent.Segment(
+                id = parsed.id,
+                index = parsed.index,
+                start = parsed.start,
+                end = parsed.end,
+                text = parsed.text,
+                language = parsed.language,
+                isFinal = parsed.isFinal,
+                provider = parsed.provider
+            )
+            "audio.transcription.done" -> UoaiAudioStreamEvent.Completed(
+                id = parsed.id,
+                model = parsed.model,
+                language = parsed.language,
+                duration = parsed.duration,
+                text = parsed.text,
+                finishReason = parsed.finishReason,
+                provider = parsed.provider
+            )
+            else -> UoaiAudioStreamEvent.Ignore
+        }
+    }
+
+    /**
+     * Resolves a sensible default `model` hint for the chosen UOAI audio `provider` when
+     * the caller hasn't pinned a specific model ID.
+     */
+    fun resolveDefaultAudioModel(providerId: String, explicitModel: String? = null): String? {
+        val trimmedModel = explicitModel?.trim().orEmpty()
+        if (trimmedModel.isNotEmpty() && !trimmedModel.equals("auto", ignoreCase = true)) {
+            return trimmedModel
+        }
+        return when (providerId.trim().lowercase()) {
+            "", UoaiConstants.AUDIO_PROVIDER_AUTO -> null
+            UoaiConstants.AUDIO_PROVIDER_GEMMA4 -> UoaiConstants.AUDIO_MODEL_GEMMA4
+            UoaiConstants.AUDIO_PROVIDER_WHISPER -> UoaiConstants.AUDIO_MODEL_WHISPER
+            UoaiConstants.AUDIO_PROVIDER_CACTUS -> UoaiConstants.AUDIO_MODEL_CACTUS
+            else -> null // External provider uses its configured default_model on server
         }
     }
 }

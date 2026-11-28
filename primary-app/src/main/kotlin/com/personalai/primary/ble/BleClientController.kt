@@ -116,6 +116,7 @@ class BleClientController @Inject constructor(
     private val msgIdGenerator = MessageIdGenerator()
     private val gattOpMutex = Mutex()
     private val commandMutex = Mutex()
+    private val connectionMutex = Mutex()
     private val sequenceGenerator = AtomicLong(1L)
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -144,6 +145,10 @@ class BleClientController @Inject constructor(
 
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
+
+    fun clearError() {
+        _lastError.value = null
+    }
 
     private val _commandFeedback = MutableSharedFlow<CommandFeedback>(extraBufferCapacity = 32)
     val commandFeedback: SharedFlow<CommandFeedback> = _commandFeedback.asSharedFlow()
@@ -180,13 +185,43 @@ class BleClientController @Inject constructor(
     private val bondReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             val action = intent.action ?: return
+            if (action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                val btState = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                when (btState) {
+                    BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                        disconnect(userInitiated = false)
+                    }
+                    BluetoothAdapter.STATE_ON -> {
+                        if (!manualDisconnect) {
+                            scheduleReconnectLoop(immediate = true)
+                        }
+                    }
+                }
+                return
+            }
+
+            // Strictly filter bond events to our paired peer so unrelated Bluetooth accessories
+            // (headphones, car kits, etc.) never display false errors or drop the active link.
+            val dev = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+            }
+            val peerAddr = targetAddress ?: activeGatt?.device?.address
+            if (dev != null && peerAddr != null && !dev.address.equals(peerAddr, ignoreCase = true)) {
+                return
+            }
             if (Build.VERSION.SDK_INT >= 36 && action == BluetoothDevice.ACTION_KEY_MISSING) {
-                _lastError.value = "Bluetooth bond key missing on peer. Re-pair if reconnection fails."
-                disconnect(userInitiated = false)
+                android.util.Log.w("BleClientController", "OS ACTION_KEY_MISSING for peer=${dev?.address}; app-level ECDH auth will renegotiate if needed")
+                if (_bleState.value == BleConnectionState.DISCONNECTED && !manualDisconnect) {
+                    scheduleReconnectLoop(immediate = false)
+                }
             } else if (action == BluetoothDevice.ACTION_BOND_STATE_CHANGED) {
                 val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
                 if (state == BluetoothDevice.BOND_NONE) {
-                    _lastError.value = "Bluetooth bond cleared; re-pair may be required."
+                    // App-level ECDH P-256 + HMAC-SHA256 + AES-256-GCM does not depend on OS bonding.
+                    android.util.Log.d("BleClientController", "OS bond state BOND_NONE for peer=${dev?.address}")
                 }
             }
         }
@@ -308,12 +343,34 @@ class BleClientController @Inject constructor(
                 pendingAuthChallenge = null
                 respondToAuthChallenge(challenge)
             }
+            // Note: App-level security uses ECDH P-256 + per-session HMAC-SHA256 + AES-256-GCM L2CAP.
+            // Avoiding forced OS createBond() prevents repeated BOND_NONE churn across OEM stacks.
+        }
+    }
 
-            activeGatt?.device?.let { dev ->
-                if (dev.bondState == BluetoothDevice.BOND_NONE) {
-                    runCatching { dev.createBond() }
-                }
-            }
+    /**
+     * Idempotent background-safe entrypoint: connects automatically if a paired recorder exists
+     * and the link is currently disconnected (without disturbing active connections or manual pauses).
+     */
+    fun ensureConnectedToPaired() {
+        scope.launch {
+            val paired = pairedDao.getPairedDevice() ?: return@launch
+            if (!permissionManager.hasBlePermissions()) return@launch
+            if (adapter?.isEnabled != true) return@launch
+            if (_bleState.value != BleConnectionState.DISCONNECTED) return@launch
+            manualDisconnect = false
+            connectToPairedRecorder(autoConnect = false)
+        }
+    }
+
+    fun pingQuietly() {
+        scope.launch {
+            if (_bleState.value != BleConnectionState.READY) return@launch
+            sendCommandWithBoundedRetries(
+                type = CommandType.PING,
+                payloadBytes = json.encodeToString(PingPayload(System.currentTimeMillis())).toByteArray(Charsets.UTF_8),
+                allowDuringSync = false
+            )
         }
     }
 
@@ -339,7 +396,12 @@ class BleClientController @Inject constructor(
             val refreshedAddress = resolveAddressByAppDeviceTag(paired.deviceId)
             if (refreshedAddress != null && refreshedAddress != paired.bleAddress) {
                 pairedDao.upsert(paired.copy(bleAddress = refreshedAddress))
-                connectInternal(refreshedAddress, autoConnect = false)
+                if (connectInternal(refreshedAddress, autoConnect = false)) {
+                    return@launch
+                }
+            }
+            if (!manualDisconnect && _bleState.value == BleConnectionState.DISCONNECTED) {
+                scheduleReconnectLoop(immediate = false)
             }
         }
     }
@@ -500,12 +562,23 @@ class BleClientController @Inject constructor(
     fun getSessionEncryptionKey(): ByteArray? = sessionKeys?.encryptionKey?.copyOf()
 
     fun updateSyncBleState(state: BleConnectionState) {
-        if (state == BleConnectionState.SYNCHRONIZING ||
-            state == BleConnectionState.SYNC_ERROR ||
-            (state == BleConnectionState.READY &&
-                (_bleState.value == BleConnectionState.SYNCHRONIZING || _bleState.value == BleConnectionState.SYNC_ERROR))
-        ) {
+        if (state == BleConnectionState.SYNCHRONIZING && _bleState.value == BleConnectionState.READY) {
             _bleState.value = state
+        } else if (state == BleConnectionState.READY &&
+            (_bleState.value == BleConnectionState.SYNCHRONIZING || _bleState.value == BleConnectionState.SYNC_ERROR)
+        ) {
+            restoreReadyIfAuthenticated()
+        } else if (state == BleConnectionState.SYNC_ERROR) {
+            // Never trap an authenticated live GATT connection in SYNC_ERROR (which deadlocks retries/commands).
+            restoreReadyIfAuthenticated()
+        }
+    }
+
+    fun restoreReadyIfAuthenticated() {
+        if (sessionKeys != null && activeGatt != null) {
+            _bleState.value = BleConnectionState.READY
+        } else if (_bleState.value == BleConnectionState.SYNCHRONIZING || _bleState.value == BleConnectionState.SYNC_ERROR) {
+            _bleState.value = BleConnectionState.DISCONNECTED
         }
     }
 
@@ -673,21 +746,22 @@ class BleClientController @Inject constructor(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun connectInternal(address: String, autoConnect: Boolean): Boolean {
-        if (!permissionManager.hasBlePermissions()) return false
-        val btAdapter = adapter ?: return false
+    private suspend fun connectInternal(address: String, autoConnect: Boolean): Boolean = connectionMutex.withLock {
+        if (!permissionManager.hasBlePermissions()) return@withLock false
+        val btAdapter = adapter ?: return@withLock false
         if (!btAdapter.isEnabled) {
             _lastError.value = "Bluetooth adapter is disabled."
-            return false
+            return@withLock false
         }
 
-        disconnect(userInitiated = false)
+        // Tear down any previous GATT cleanly without touching manualDisconnect or cancelling reconnect loop.
+        teardownGattLocked()
         targetAddress = address
         _bleState.value = BleConnectionState.CONNECTING
 
         val device = runCatching { btAdapter.getRemoteDevice(address) }.getOrNull() ?: run {
             _bleState.value = BleConnectionState.DISCONNECTED
-            return false
+            return@withLock false
         }
 
         val servicesReady = CompletableDeferred<Boolean>()
@@ -696,55 +770,93 @@ class BleClientController @Inject constructor(
         val gatt = device.connectGatt(context, autoConnect, gattCallback, BluetoothDevice.TRANSPORT_LE)
             ?: run {
                 _bleState.value = BleConnectionState.DISCONNECTED
-                return false
+                return@withLock false
             }
         activeGatt = gatt
 
-        val discovered = withTimeoutOrNull(15_000L) { servicesReady.await() } ?: false
-        if (!discovered) {
-            disconnect(userInitiated = false)
-            return false
+        val discovered = withTimeoutOrNull(12_000L) { servicesReady.await() } ?: false
+        if (!discovered || activeGatt !== gatt) {
+            if (activeGatt === gatt) {
+                teardownGattLocked()
+            } else {
+                runCatching { gatt.close() }
+            }
+            return@withLock false
         }
 
         negotiateMtu(512)
         gattOpMutex.withLock {
             runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) }
         }
+        // Subscribe CHAR_SYNC first so CHAR_STATUS + CHAR_ACK (which trigger AUTH_CHALLENGE on Secondary)
+        // never contend with subsequent CCCD or config reads!
+        enableNotification(charSync)
         enableNotification(charStatus)
         enableNotification(charAck)
-        enableNotification(charSync)
-        readInitialConfigSnapshot()
-        return true
+        return@withLock true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun teardownGattLocked() {
+        sessionKeys = null
+        sessionContext = ByteArray(0)
+        pendingAuthChallenge = null
+        servicesDeferred?.complete(false)
+        servicesDeferred = null
+        statusReassembler.clear()
+        ackReassembler.clear()
+        pendingAcks.values.forEach { it.cancel() }
+        pendingAcks.clear()
+
+        val old = activeGatt
+        activeGatt = null
+        old?.let { gatt ->
+            runCatching { gatt.disconnect() }
+            runCatching { gatt.close() }
+        }
+        _bleState.value = BleConnectionState.DISCONNECTED
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            // CRITICAL: Ignore delayed callbacks from previously closed BluetoothGatt instances so
+            // they can never abort or clear a newer connection attempt.
+            if (gatt !== activeGatt) {
+                runCatching { gatt.close() }
+                return
+            }
             if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                 _bleState.value = BleConnectionState.CONNECTED
-                gatt.discoverServices()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                if (!gatt.discoverServices()) {
+                    servicesDeferred?.complete(false)
+                }
+            } else {
+                // Handles STATE_DISCONNECTED AND error statuses (e.g. GATT_ERROR 133 / 8 / 19) immediately
+                // instead of hanging until the 12s service discovery timeout expires.
+                android.util.Log.w("BleClientController", "GATT disconnected/error status=$status newState=$newState")
                 sessionKeys = null
                 sessionContext = ByteArray(0)
                 servicesDeferred?.complete(false)
                 _bleState.value = BleConnectionState.DISCONNECTED
+                activeGatt = null
                 runCatching { gatt.close() }
-                if (activeGatt == gatt) activeGatt = null
 
                 if (!manualDisconnect) {
-                    scheduleReconnectLoop()
+                    scheduleReconnectLoop(immediate = false)
                 }
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (gatt !== activeGatt) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 servicesDeferred?.complete(false)
                 return
             }
             val service = gatt.getService(BleProtocolConstants.SERVICE_UUID)
             if (service == null) {
-                _lastError.value = "Target device does not expose AI Recorder GATT service."
+                _lastError.value = "Target device does not expose Sunbo Recorder GATT service."
                 servicesDeferred?.complete(false)
                 return
             }
@@ -758,6 +870,7 @@ class BleClientController @Inject constructor(
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (gatt !== activeGatt) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 negotiatedMtu = mtu.coerceIn(BleChunkFraming.MIN_ATT_MTU, 517)
             }
@@ -769,6 +882,7 @@ class BleClientController @Inject constructor(
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
+            if (gatt !== activeGatt) return
             descriptorWriteDeferred?.complete(status)
         }
 
@@ -777,6 +891,7 @@ class BleClientController @Inject constructor(
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            if (gatt !== activeGatt) return
             characteristicWriteDeferred?.complete(status)
         }
 
@@ -786,6 +901,7 @@ class BleClientController @Inject constructor(
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            if (gatt !== activeGatt) return
             @Suppress("DEPRECATION")
             val bytes = characteristic.value ?: ByteArray(0)
             characteristicReadDeferred?.complete(status to bytes)
@@ -797,6 +913,7 @@ class BleClientController @Inject constructor(
             value: ByteArray,
             status: Int
         ) {
+            if (gatt !== activeGatt) return
             characteristicReadDeferred?.complete(status to value)
         }
 
@@ -805,6 +922,7 @@ class BleClientController @Inject constructor(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
+            if (gatt !== activeGatt) return
             @Suppress("DEPRECATION")
             val value = characteristic.value ?: return
             handleCharacteristicNotify(characteristic.uuid, value)
@@ -815,6 +933,7 @@ class BleClientController @Inject constructor(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
+            if (gatt !== activeGatt) return
             handleCharacteristicNotify(characteristic.uuid, value)
         }
     }
@@ -927,6 +1046,7 @@ class BleClientController @Inject constructor(
                     persistTelemetrySnapshot(st)
                 }
             }
+            readInitialConfigSnapshot()
             refreshBattery()
             refreshStorage()
             refreshDeviceInfo()
@@ -1100,19 +1220,42 @@ class BleClientController @Inject constructor(
                 rttMs = feedback.rttMs
             )
         )
+        runCatching { auditDao.pruneKeepingLatest(500) }
     }
 
-    private fun scheduleReconnectLoop() {
+    private fun scheduleReconnectLoop(immediate: Boolean = false) {
         if (reconnectJob?.isActive == true) return
         reconnectJob = scope.launch {
-            val delays = listOf(2_000L, 4_000L, 8_000L, 15_000L)
-            for (waitMs in delays) {
-                if (manualDisconnect || _bleState.value != BleConnectionState.DISCONNECTED) break
-                delay(waitMs)
-                val paired = pairedDao.getPairedDevice() ?: break
-                if (connectInternal(paired.bleAddress, autoConnect = true)) {
-                    break
+            val backoffSchedule = listOf(2_000L, 4_000L, 8_000L, 15_000L, 30_000L, 45_000L)
+            var attempt = 0
+            while (!manualDisconnect && _bleState.value == BleConnectionState.DISCONNECTED) {
+                val waitMs = if (immediate && attempt == 0) {
+                    500L
+                } else {
+                    backoffSchedule[minOf(attempt, backoffSchedule.lastIndex)]
                 }
+                delay(waitMs)
+                if (manualDisconnect || _bleState.value != BleConnectionState.DISCONNECTED) break
+                val paired = pairedDao.getPairedDevice() ?: break
+                if (!permissionManager.hasBlePermissions() || adapter?.isEnabled != true) {
+                    attempt++
+                    continue
+                }
+                // Alternate direct MAC connect with app-level deviceTag scan so rotated BLE RPA MACs
+                // recover automatically in the background without manual re-pairing.
+                val directOk = connectInternal(paired.bleAddress, autoConnect = false)
+                if (directOk) break
+
+                if (attempt % 2 == 1) {
+                    val refreshedAddress = resolveAddressByAppDeviceTag(paired.deviceId)
+                    if (refreshedAddress != null) {
+                        if (refreshedAddress != paired.bleAddress) {
+                            pairedDao.upsert(paired.copy(bleAddress = refreshedAddress))
+                        }
+                        if (connectInternal(refreshedAddress, autoConnect = false)) break
+                    }
+                }
+                attempt++
             }
         }
     }
@@ -1120,6 +1263,7 @@ class BleClientController @Inject constructor(
     private fun registerBondReceiver() {
         if (receiverRegistered) return
         val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED).apply {
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             if (Build.VERSION.SDK_INT >= 36) {
                 addAction(BluetoothDevice.ACTION_KEY_MISSING)
             }

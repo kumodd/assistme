@@ -92,6 +92,7 @@ class L2capSyncServer @Inject constructor(
                 if (stateMachine.bleState.value == BleConnectionState.SYNCHRONIZING) {
                     stateMachine.updateBleState(BleConnectionState.READY)
                 }
+                runCatching { repository.resetInterruptedSyncItems() }
                 closeSocketOnly()
             }
         }

@@ -13,10 +13,16 @@ import android.os.ParcelUuid
 import com.personalai.primary.permissions.PrimaryPermissionManager
 import com.personalai.protocol.BleProtocolConstants
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -35,6 +41,7 @@ class BleScannerManager @Inject constructor(
 ) {
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? get() = bluetoothManager.adapter
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
@@ -47,9 +54,10 @@ class BleScannerManager @Inject constructor(
 
     private var scanner: BluetoothLeScanner? = null
     private var activeCallback: ScanCallback? = null
+    private var autoStopJob: Job? = null
 
     @SuppressLint("MissingPermission")
-    fun startScan() {
+    fun startScan(timeoutMs: Long = DEFAULT_SCAN_TIMEOUT_MS) {
         if (_isScanning.value) return
         if (!permissionManager.hasBlePermissions()) {
             _scanError.value = "Bluetooth scan/connect permission required."
@@ -86,7 +94,7 @@ class BleScannerManager @Inject constructor(
                 val tagHex = tagBytes?.joinToString("") { "%02x".format(it) }
                 val entry = DiscoveredRecorderDevice(
                     address = dev.address,
-                    name = scanRecord?.deviceName ?: dev.name ?: "AI Memory Recorder",
+                    name = scanRecord?.deviceName ?: dev.name ?: "Sunbo Recorder",
                     rssi = result.rssi,
                     deviceTagHex = tagHex,
                     bondState = dev.bondState
@@ -98,6 +106,8 @@ class BleScannerManager @Inject constructor(
             }
 
             override fun onScanFailed(errorCode: Int) {
+                autoStopJob?.cancel()
+                autoStopJob = null
                 _isScanning.value = false
                 _scanError.value = "BLE scan failed (errorCode=$errorCode)"
             }
@@ -105,10 +115,19 @@ class BleScannerManager @Inject constructor(
         activeCallback = callback
         _isScanning.value = true
         leScanner.startScan(listOf(filter), settings, callback)
+
+        // Bound active BLE scanning so SCAN_MODE_LOW_LATENCY never drains battery or hits Android's scan throttle.
+        autoStopJob?.cancel()
+        autoStopJob = scope.launch {
+            delay(timeoutMs.coerceIn(3_000L, 45_000L))
+            stopScan()
+        }
     }
 
     @SuppressLint("MissingPermission")
     fun stopScan() {
+        autoStopJob?.cancel()
+        autoStopJob = null
         if (!_isScanning.value) return
         activeCallback?.let { cb ->
             runCatching { scanner?.stopScan(cb) }
@@ -116,5 +135,13 @@ class BleScannerManager @Inject constructor(
         activeCallback = null
         scanner = null
         _isScanning.value = false
+    }
+
+    fun clearError() {
+        _scanError.value = null
+    }
+
+    companion object {
+        const val DEFAULT_SCAN_TIMEOUT_MS = 20_000L
     }
 }

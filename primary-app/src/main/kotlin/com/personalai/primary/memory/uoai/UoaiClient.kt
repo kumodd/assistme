@@ -21,6 +21,8 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -48,15 +50,24 @@ class UoaiClient @Inject constructor(
         explicitNulls = false
     }
 
-    // Dedicated OkHttpClient with 300s read timeout matching UOAI Provider generation timeout.
+    // Dedicated OkHttpClient with 300s read timeout matching UOAI Provider generation & external audio timeout.
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(3, TimeUnit.SECONDS)
         .readTimeout(UoaiConstants.GENERATION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
     private val _connectionState = MutableStateFlow<UoaiConnectionState?>(null)
     val connectionState: StateFlow<UoaiConnectionState?> = _connectionState.asStateFlow()
+
+    private val _audioStatus = MutableStateFlow<UoaiAudioStatusResponse?>(null)
+    val audioStatus: StateFlow<UoaiAudioStatusResponse?> = _audioStatus.asStateFlow()
+
+    private val _audioProviders = MutableStateFlow<List<UoaiAudioProviderInfo>>(emptyList())
+    val audioProviders: StateFlow<List<UoaiAudioProviderInfo>> = _audioProviders.asStateFlow()
+
+    private val _audioModels = MutableStateFlow<List<UoaiAudioModelInfo>>(emptyList())
+    val audioModels: StateFlow<List<UoaiAudioModelInfo>> = _audioModels.asStateFlow()
 
     @Volatile
     var cachedCapabilities: UoaiCapabilities? = null
@@ -121,6 +132,9 @@ class UoaiClient @Inject constructor(
         credentialsStore.clearUoaiCredentials()
         cachedCapabilities = null
         cachedActiveModel = null
+        _audioStatus.value = null
+        _audioProviders.value = emptyList()
+        _audioModels.value = emptyList()
     }
 
     suspend fun checkConnection(): UoaiConnectionState = withContext(Dispatchers.IO) {
@@ -129,13 +143,30 @@ class UoaiClient @Inject constructor(
         state
     }
 
+    suspend fun refreshAudioInfo(): UoaiAudioStatusResponse? = withContext(Dispatchers.IO) {
+        val token = credentialsStore.getUoaiToken()
+        if (!isProviderInstalled() || token.isNullOrBlank()) {
+            _audioStatus.value = null
+            _audioProviders.value = emptyList()
+            _audioModels.value = emptyList()
+            return@withContext null
+        }
+        refreshAudioInfoInternal(token)
+    }
+
     private fun evaluateConnection(): UoaiConnectionState {
         if (!isProviderInstalled()) {
+            _audioStatus.value = null
+            _audioProviders.value = emptyList()
+            _audioModels.value = emptyList()
             return UoaiConnectionState.ProviderNotInstalled
         }
 
         val token = credentialsStore.getUoaiToken()
         if (token.isNullOrBlank()) {
+            _audioStatus.value = null
+            _audioProviders.value = emptyList()
+            _audioModels.value = emptyList()
             return UoaiConnectionState.NeedsRegistration(registrationIntent())
         }
 
@@ -143,14 +174,22 @@ class UoaiClient @Inject constructor(
         val health = try {
             fetchHealth()
         } catch (_: ConnectException) {
+            _audioStatus.value = null
+            _audioProviders.value = emptyList()
+            _audioModels.value = emptyList()
             return UoaiConnectionState.ProviderNotRunning(openProviderIntent())
-        } catch (e: IOException) {
+        } catch (_: IOException) {
+            _audioStatus.value = null
+            _audioProviders.value = emptyList()
+            _audioModels.value = emptyList()
             return UoaiConnectionState.ProviderNotRunning(openProviderIntent())
         } catch (e: Throwable) {
             return UoaiConnectionState.Error(e.message ?: "Health check failed", launchProviderIntent = openProviderIntent())
         }
 
         if (!health.modelLoaded) {
+            // Even when Gemma LLM isn't loaded yet, dedicated Whisper / Cactus / external audio providers may be ready.
+            runCatching { refreshAudioInfoInternal(token) }
             return UoaiConnectionState.ModelNotReady(
                 modelState = health.modelState,
                 modelError = health.modelError,
@@ -158,13 +197,14 @@ class UoaiClient @Inject constructor(
             )
         }
 
-        // 2. Authenticated capabilities + active model inspection
+        // 2. Authenticated capabilities + active model + audio provider inspection
         return try {
             val caps = fetchCapabilities(token)
             val models = fetchModels(token)
             val activeModel = models.firstOrNull { it.ready } ?: models.firstOrNull()
             cachedCapabilities = caps
             cachedActiveModel = activeModel
+            runCatching { refreshAudioInfoInternal(token) }
             UoaiConnectionState.Connected(activeModel = activeModel, capabilities = caps)
         } catch (e: UoaiException.NotRegistered) {
             // Automatically clear stale/revoked token per developer guide.
@@ -185,6 +225,16 @@ class UoaiClient @Inject constructor(
                 launchProviderIntent = openProviderIntent()
             )
         }
+    }
+
+    private fun refreshAudioInfoInternal(token: String): UoaiAudioStatusResponse? {
+        val status = runCatching { fetchAudioStatus(token) }.getOrNull()
+        val providers = runCatching { fetchAudioProviders(token) }.getOrNull()
+        val models = runCatching { fetchAudioModels(token) }.getOrNull()
+        if (status != null) _audioStatus.value = status
+        if (providers != null) _audioProviders.value = providers.data
+        if (models != null) _audioModels.value = models.data
+        return status
     }
 
     suspend fun chatCompletion(
@@ -226,6 +276,13 @@ class UoaiClient @Inject constructor(
         repeat(2) { attempt ->
             try {
                 return@withContext executeChatCompletionOnce(token, bodyBytes)
+            } catch (e: UoaiException.TransientBusy) {
+                lastError = e
+                if (e.httpStatus == 429 && attempt == 0) {
+                    delay(1_500L)
+                } else {
+                    throw e
+                }
             } catch (e: UoaiException.ApiError) {
                 lastError = e
                 if (e.httpStatus == 429 && attempt == 0) {
@@ -322,6 +379,215 @@ class UoaiClient @Inject constructor(
     suspend fun cancelRequest(requestId: String): Boolean = withContext(Dispatchers.IO) {
         val token = credentialsStore.getUoaiToken() ?: return@withContext false
         cancelRequestInternal(token, requestId)
+    }
+
+    /**
+     * Transcribes WAV audio via `POST /v1/audio/transcriptions` using the raw `audio/wav` binary fast path
+     * with parameters in URL query strings (avoids Ktor's 64 KiB multipart `formFieldLimit` on chunks > 2s).
+     * Supports direct Gemma 4 Multimodal (`provider=gemma4`), on-device Whisper (`whisper`),
+     * Hinglish Cactus (`cactus`), and any external provider configured in UOAI Provider.
+     */
+    suspend fun transcribeAudio(
+        wavBytes: ByteArray,
+        fileName: String,
+        params: UoaiAudioTranscriptionParams = UoaiAudioTranscriptionParams()
+    ): UoaiAudioTranscriptionResponse = withContext(Dispatchers.IO) {
+        val token = requireReadyToken()
+        if (wavBytes.isEmpty()) {
+            throw UoaiException.ApiError("Audio clip is empty.", code = "missing_audio_file", status = 400)
+        }
+        val maxBytes = _audioStatus.value?.maxUploadBytes ?: UoaiConstants.MAX_AUDIO_UPLOAD_BYTES
+        if (wavBytes.size.toLong() > maxBytes) {
+            throw UoaiException.ApiError(
+                "Audio chunk (${wavBytes.size / (1024 * 1024)} MiB) exceeds UOAI limit (${maxBytes / (1024 * 1024)} MiB).",
+                code = "audio_too_large",
+                status = 413
+            )
+        }
+
+        val endpointUrl = buildAudioEndpointUrl("${UoaiConstants.BASE_URL}/audio/transcriptions", params)
+        val request = Request.Builder()
+            .url(endpointUrl)
+            .header("Authorization", "Bearer $token")
+            .header("X-Audio-Filename", if (fileName.endsWith(".wav", ignoreCase = true)) fileName else "$fileName.wav")
+            .post(wavBytes.toRequestBody("audio/wav".toMediaType()))
+            .build()
+
+        val call = http.newCall(request)
+        var requestId: String? = null
+        try {
+            val response = try {
+                call.execute()
+            } catch (e: ConnectException) {
+                _connectionState.value = UoaiConnectionState.ProviderNotRunning(openProviderIntent())
+                throw UoaiException.ProviderNotRunning(e)
+            } catch (e: SocketTimeoutException) {
+                throw UoaiException.TransientBusy(
+                    "UOAI audio transcription timed out.",
+                    code = "request_timeout",
+                    status = 504
+                )
+            }
+
+            response.use { resp ->
+                requestId = resp.header("X-Request-Id")
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw mapHttpError(resp.code, raw, isAudioEndpoint = true)
+                }
+                if (params.responseFormat.equals("text", ignoreCase = true)) {
+                    return@withContext UoaiAudioTranscriptionResponse(
+                        id = requestId.orEmpty(),
+                        text = raw.trim(),
+                        model = params.model.orEmpty(),
+                        language = params.language,
+                        provider = params.provider
+                    )
+                }
+                return@withContext json.decodeFromString<UoaiAudioTranscriptionResponse>(raw)
+            }
+        } catch (ce: CancellationException) {
+            call.cancel()
+            val rid = requestId
+            if (!rid.isNullOrBlank()) {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    runCatching { cancelRequestInternal(token, rid) }
+                }
+            }
+            throw ce
+        }
+    }
+
+    /**
+     * Streams transcription events via `POST /v1/audio/stream` (SSE) using the raw `audio/wav` binary fast path.
+     * Automatically sends `POST /v1/cancel` when the collecting coroutine is cancelled.
+     */
+    fun transcribeAudioStream(
+        wavBytes: ByteArray,
+        fileName: String,
+        params: UoaiAudioTranscriptionParams = UoaiAudioTranscriptionParams()
+    ): Flow<UoaiAudioStreamEvent> = flow {
+        val token = requireReadyToken()
+        if (wavBytes.isEmpty()) {
+            throw UoaiException.ApiError("Audio clip is empty.", code = "missing_audio_file", status = 400)
+        }
+        val maxBytes = _audioStatus.value?.maxUploadBytes ?: UoaiConstants.MAX_AUDIO_UPLOAD_BYTES
+        if (wavBytes.size.toLong() > maxBytes) {
+            throw UoaiException.ApiError("Audio chunk exceeds UOAI 25 MiB limit.", code = "audio_too_large", status = 413)
+        }
+
+        val endpointUrl = buildAudioEndpointUrl("${UoaiConstants.BASE_URL}/audio/stream", params)
+        val request = Request.Builder()
+            .url(endpointUrl)
+            .header("Authorization", "Bearer $token")
+            .header("Accept", "text/event-stream")
+            .header("X-Audio-Filename", if (fileName.endsWith(".wav", ignoreCase = true)) fileName else "$fileName.wav")
+            .post(wavBytes.toRequestBody("audio/wav".toMediaType()))
+            .build()
+
+        val call = http.newCall(request)
+        var requestId: String? = null
+        try {
+            val response = try {
+                call.execute()
+            } catch (e: ConnectException) {
+                _connectionState.value = UoaiConnectionState.ProviderNotRunning(openProviderIntent())
+                throw UoaiException.ProviderNotRunning(e)
+            } catch (e: SocketTimeoutException) {
+                throw UoaiException.TransientBusy("UOAI audio stream timed out.", code = "request_timeout", status = 504)
+            }
+
+            response.use { resp ->
+                requestId = resp.header("X-Request-Id")
+                if (!resp.isSuccessful) {
+                    val errText = resp.body?.string().orEmpty()
+                    throw mapHttpError(resp.code, errText, isAudioEndpoint = true)
+                }
+                val source = resp.body?.charStream()?.buffered()
+                    ?: throw UoaiException.ApiError("Empty SSE audio stream from UOAI provider")
+
+                while (true) {
+                    val line = source.readLine() ?: break
+                    when (val ev = UoaiProtocolHelpers.parseAudioSseLine(line)) {
+                        UoaiAudioStreamEvent.Done -> {
+                            emit(ev)
+                            break
+                        }
+                        UoaiAudioStreamEvent.Cancelled -> throw UoaiException.RequestCancelled("Audio transcription cancelled.")
+                        is UoaiAudioStreamEvent.StreamError -> throw UoaiException.ApiError(ev.message, ev.code)
+                        UoaiAudioStreamEvent.Ignore -> Unit
+                        else -> emit(ev)
+                    }
+                }
+            }
+        } catch (ce: CancellationException) {
+            call.cancel()
+            val rid = requestId
+            if (!rid.isNullOrBlank()) {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    runCatching { cancelRequestInternal(token, rid) }
+                }
+            }
+            throw ce
+        }
+    }.flowOn(Dispatchers.IO)
+
+    /**
+     * Preloads a dedicated local Whisper or Cactus model via `POST /v1/audio/models/load`
+     * (requires `asr_model_control` permission in UOAI Provider).
+     */
+    suspend fun loadAudioModel(model: String): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val token = requireReadyToken()
+            val payload = json.encodeToString(UoaiAudioLoadRequest(model = model.trim()))
+            val req = Request.Builder()
+                .url("${UoaiConstants.BASE_URL}/audio/models/load")
+                .header("Authorization", "Bearer $token")
+                .post(payload.toRequestBody("application/json".toMediaType()))
+                .build()
+            val response = try {
+                http.newCall(req).execute()
+            } catch (e: ConnectException) {
+                throw UoaiException.ProviderNotRunning(e)
+            }
+            response.use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw mapHttpError(resp.code, raw, isAudioEndpoint = true)
+                }
+                runCatching { refreshAudioInfoInternal(token) }
+                "Loaded UOAI audio model '$model'."
+            }
+        }
+    }
+
+    /**
+     * Unloads dedicated local Whisper/Cactus models via `POST /v1/audio/models/unload`
+     * (requires `asr_model_control` permission in UOAI Provider).
+     */
+    suspend fun unloadAudioModel(force: Boolean = false): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val token = requireReadyToken()
+            val payload = json.encodeToString(UoaiAudioUnloadRequest(force = force))
+            val req = Request.Builder()
+                .url("${UoaiConstants.BASE_URL}/audio/models/unload")
+                .header("Authorization", "Bearer $token")
+                .post(payload.toRequestBody("application/json".toMediaType()))
+                .build()
+            val response = try {
+                http.newCall(req).execute()
+            } catch (e: ConnectException) {
+                throw UoaiException.ProviderNotRunning(e)
+            }
+            response.use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    throw mapHttpError(resp.code, raw, isAudioEndpoint = true)
+                }
+                runCatching { refreshAudioInfoInternal(token) }
+                "Unloaded local UOAI audio models from RAM."
+            }
+        }
     }
 
     private fun cancelRequestInternal(token: String, requestId: String): Boolean {
@@ -439,7 +705,61 @@ class UoaiClient @Inject constructor(
         }
     }
 
-    private fun mapHttpError(httpCode: Int, rawBody: String): UoaiException {
+    private fun fetchAudioStatus(token: String): UoaiAudioStatusResponse {
+        val req = Request.Builder()
+            .url("${UoaiConstants.BASE_URL}/audio/status")
+            .header("Authorization", "Bearer $token")
+            .get()
+            .build()
+        val resp = try {
+            http.newCall(req).execute()
+        } catch (e: ConnectException) {
+            throw UoaiException.ProviderNotRunning(e)
+        }
+        resp.use {
+            val body = it.body?.string().orEmpty()
+            if (!it.isSuccessful) throw mapHttpError(it.code, body, isAudioEndpoint = true)
+            return json.decodeFromString(body)
+        }
+    }
+
+    private fun fetchAudioProviders(token: String): UoaiAudioProvidersResponse {
+        val req = Request.Builder()
+            .url("${UoaiConstants.BASE_URL}/audio/providers")
+            .header("Authorization", "Bearer $token")
+            .get()
+            .build()
+        val resp = try {
+            http.newCall(req).execute()
+        } catch (e: ConnectException) {
+            throw UoaiException.ProviderNotRunning(e)
+        }
+        resp.use {
+            val body = it.body?.string().orEmpty()
+            if (!it.isSuccessful) throw mapHttpError(it.code, body, isAudioEndpoint = true)
+            return json.decodeFromString(body)
+        }
+    }
+
+    private fun fetchAudioModels(token: String): UoaiAudioModelsResponse {
+        val req = Request.Builder()
+            .url("${UoaiConstants.BASE_URL}/audio/models")
+            .header("Authorization", "Bearer $token")
+            .get()
+            .build()
+        val resp = try {
+            http.newCall(req).execute()
+        } catch (e: ConnectException) {
+            throw UoaiException.ProviderNotRunning(e)
+        }
+        resp.use {
+            val body = it.body?.string().orEmpty()
+            if (!it.isSuccessful) throw mapHttpError(it.code, body, isAudioEndpoint = true)
+            return json.decodeFromString(body)
+        }
+    }
+
+    private fun mapHttpError(httpCode: Int, rawBody: String, isAudioEndpoint: Boolean = false): UoaiException {
         val parsed = runCatching { json.decodeFromString<UoaiErrorEnvelope>(rawBody) }.getOrNull()?.error
         val code = parsed?.code
         val msg = parsed?.message ?: "UOAI HTTP $httpCode: ${rawBody.take(200)}"
@@ -450,16 +770,60 @@ class UoaiClient @Inject constructor(
                 UoaiException.NotRegistered(msg, code)
             }
             403 -> UoaiException.PermissionDenied(msg, code)
-            409 -> UoaiException.RequestCancelled(msg)
-            503 -> {
-                _connectionState.value = UoaiConnectionState.ModelNotReady("NOT_READY", msg, openProviderIntent())
-                UoaiException.ModelNotReady(msg, code)
+            409 -> when (code) {
+                "asr_busy" -> UoaiException.TransientBusy(msg, code, 409)
+                "model_mismatch" -> UoaiException.ApiError(msg, code, 409)
+                else -> UoaiException.RequestCancelled(msg)
             }
+            429 -> UoaiException.TransientBusy(msg, code ?: "queue_full", 429)
+            503 -> {
+                if (!isAudioEndpoint || code == "model_not_ready") {
+                    _connectionState.value = UoaiConnectionState.ModelNotReady("NOT_READY", msg, openProviderIntent())
+                }
+                if (code == "thermal_throttled") {
+                    UoaiException.TransientBusy(msg, code, 503)
+                } else {
+                    UoaiException.ModelNotReady(msg, code ?: if (isAudioEndpoint) "asr_model_not_ready" else "model_not_ready")
+                }
+            }
+            504 -> UoaiException.TransientBusy(msg, code ?: "request_timeout", 504)
             else -> UoaiException.ApiError(msg, code, httpCode)
         }
     }
 
     companion object {
         private const val TAG = "UoaiClient"
+
+        fun buildAudioEndpointUrl(
+            baseEndpoint: String,
+            params: UoaiAudioTranscriptionParams
+        ): HttpUrl {
+            val builder = baseEndpoint.toHttpUrl().newBuilder()
+            val providerClean = params.provider.trim()
+            if (providerClean.isNotEmpty()) {
+                builder.addQueryParameter("provider", providerClean)
+            }
+            val modelClean = params.model?.trim().orEmpty()
+            if (modelClean.isNotEmpty()) {
+                builder.addQueryParameter("model", modelClean)
+            }
+            val langClean = params.language?.trim().orEmpty()
+            if (langClean.isNotEmpty()) {
+                builder.addQueryParameter("language", langClean)
+            }
+            val promptClean = params.prompt?.trim().orEmpty()
+            if (promptClean.isNotEmpty()) {
+                builder.addQueryParameter("prompt", promptClean)
+            }
+            val scriptClean = params.script?.trim().orEmpty()
+            if (scriptClean.isNotEmpty()) {
+                builder.addQueryParameter("script", scriptClean)
+            }
+            builder.addQueryParameter("response_format", params.responseFormat.ifBlank { "verbose_json" })
+            builder.addQueryParameter("temperature", params.temperature.coerceIn(0f, 1f).toString())
+            builder.addQueryParameter("translate", params.translate.toString())
+            builder.addQueryParameter("timestamps", params.timestamps.toString())
+            return builder.build()
+        }
     }
 }

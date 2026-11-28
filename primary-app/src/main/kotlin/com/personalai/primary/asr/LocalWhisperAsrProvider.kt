@@ -53,9 +53,11 @@ class LocalWhisperAsrProvider @Inject constructor(
                 .addFormDataPart("model", request.localModel.ifBlank { "whisper-local" })
                 .addFormDataPart("response_format", "verbose_json")
 
-            request.languageMode.isoHint?.let { lang ->
-                multipartBuilder.addFormDataPart("language", lang)
-            }
+            request.languageMode.isoHint
+                ?.takeIf { !it.contains(',') }
+                ?.let { lang ->
+                    multipartBuilder.addFormDataPart("language", lang)
+                }
 
             val req = Request.Builder()
                 .url(endpoint)

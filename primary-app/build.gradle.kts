@@ -16,6 +16,8 @@ val keystoreProps = Properties().apply {
     }
 }
 
+val enableAbiSplits = project.findProperty("enableAbiSplits")?.toString()?.toBoolean() == true
+
 android {
     namespace = "com.personalai.primary"
     compileSdk = 36
@@ -24,8 +26,8 @@ android {
         applicationId = "com.personalai.primary"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -53,6 +55,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Keep ARM mobile ABIs only for Play Store release; Play splits deliver a single ABI per device (~17-22 MB).
+            if (!enableAbiSplits) {
+                ndk {
+                    abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+                }
+            }
             if (signingConfigs.getByName("release").storeFile?.exists() == true) {
                 signingConfig = signingConfigs.getByName("release")
             }
@@ -71,6 +79,18 @@ android {
         }
     }
 
+    // Optional standalone per-ABI APK splits when building with -PenableAbiSplits=true
+    if (enableAbiSplits) {
+        splits {
+            abi {
+                isEnable = true
+                reset()
+                include("arm64-v8a", "armeabi-v7a")
+                isUniversalApk = false
+            }
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -83,6 +103,9 @@ android {
         buildConfig = true
     }
     packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
@@ -96,12 +119,14 @@ ksp {
 
 dependencies {
     implementation(project(":shared-protocol"))
+    implementation(project(":recorder-app"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.lifecycle.service)
     implementation(libs.androidx.navigation.compose)
 
     implementation(platform(libs.androidx.compose.bom))

@@ -5,7 +5,8 @@ object LanguageDetector {
     fun normalizeAndRefine(providerLanguage: String?, transcriptText: String): String {
         val raw = providerLanguage?.trim()?.lowercase()
         val normalizedProvider = when {
-            raw == null || raw.isEmpty() -> null
+            raw == null || raw.isEmpty() || raw == "auto" -> null
+            raw == "en,hi" || raw == "hi,en" || raw == "hi-en" || raw == "en-hi" || raw == "hinglish" -> "hi-en"
             raw == "english" || raw.startsWith("en") -> "en"
             raw == "hindi" || raw.startsWith("hi") -> "hi"
             else -> raw.take(8)

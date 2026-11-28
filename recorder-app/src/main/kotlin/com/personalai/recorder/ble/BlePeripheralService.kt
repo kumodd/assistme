@@ -10,6 +10,7 @@ import androidx.core.app.ServiceCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.personalai.recorder.data.db.DiagnosticSeverity
+import com.personalai.recorder.data.prefs.RecorderPreferencesRepository
 import com.personalai.recorder.data.repo.RecorderRepository
 import com.personalai.recorder.domain.state.RecorderStateMachine
 import com.personalai.recorder.service.NotificationHelper
@@ -31,6 +32,7 @@ class BlePeripheralService : LifecycleService() {
     @Inject lateinit var pairingStore: PairingCredentialsStore
     @Inject lateinit var stateMachine: RecorderStateMachine
     @Inject lateinit var repository: RecorderRepository
+    @Inject lateinit var prefs: RecorderPreferencesRepository
     @Inject lateinit var notificationHelper: NotificationHelper
 
     private var statusObserverJob: Job? = null
@@ -44,11 +46,14 @@ class BlePeripheralService : LifecycleService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         if (intent?.action == ACTION_STOP_BLE_HOST) {
+            lifecycleScope.launch { prefs.setBleHostDesired(false) }
             blePeripheralManager.stopHosting()
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
+
+        lifecycleScope.launch { prefs.setBleHostDesired(true) }
 
         val notification = notificationHelper.buildBleHostNotification(
             bleStateLabel = stateMachine.bleState.value.name,
@@ -92,7 +97,7 @@ class BlePeripheralService : LifecycleService() {
         }
 
         observeNotificationUpdates()
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     private fun observeNotificationUpdates() {

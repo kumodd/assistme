@@ -61,7 +61,6 @@ import com.personalai.protocol.SyncDataRequestPayload
 import com.personalai.protocol.SyncManifestSummaryPayload
 import com.personalai.protocol.SyncSegmentDescriptor
 import com.personalai.protocol.SyncTransportMode
-import com.personalai.recorder.BuildConfig
 import com.personalai.recorder.data.db.DiagnosticSeverity
 import com.personalai.recorder.data.prefs.RecorderPreferencesRepository
 import com.personalai.recorder.data.repo.RecorderRepository
@@ -82,6 +81,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -164,16 +164,59 @@ class BlePeripheralManager @Inject constructor(
     private var statusPushJob: Job? = null
 
     private val bondReceiver = object : BroadcastReceiver() {
+        @SuppressLint("MissingPermission")
         override fun onReceive(ctx: Context, intent: Intent) {
             val action = intent.action ?: return
+            if (action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                val btState = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                when (btState) {
+                    BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                        resetConnectionSession()
+                        stateMachine.updateBleState(BleConnectionState.DISCONNECTED)
+                        _hostState.value = _hostState.value.copy(
+                            isAdvertising = false,
+                            connectedDeviceAddress = null,
+                            lastHostError = "Bluetooth turned off; will resume automatically when re-enabled."
+                        )
+                    }
+                    BluetoothAdapter.STATE_ON -> {
+                        if (_hostState.value.isHosting) {
+                            scope.launch {
+                                runCatching { gattServer?.close() }
+                                gattServer = null
+                                val adapter = bluetoothAdapter ?: return@launch
+                                val server = bluetoothManager.openGattServer(context, gattCallback)
+                                if (server != null && server.addService(buildGattService())) {
+                                    gattServer = server
+                                    startAdvertising(adapter)
+                                    _hostState.value = _hostState.value.copy(lastHostError = null)
+                                    repository.logEvent("BLE_HOST", DiagnosticSeverity.INFO, "Auto-restarted BLE GATT server after Bluetooth turned ON")
+                                }
+                            }
+                        }
+                    }
+                }
+                return
+            }
+
+            // Strictly filter bond events to the connected/paired peer device so unrelated BT devices never log noise.
+            val dev = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+            }
+            val peerAddr = connectedDevice?.address ?: return
+            if (dev != null && !dev.address.equals(peerAddr, ignoreCase = true)) return
+
             if (action == BluetoothDevice.ACTION_BOND_STATE_CHANGED) {
                 val bondState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
                 if (bondState == BluetoothDevice.BOND_NONE) {
                     scope.launch {
                         repository.logEvent(
                             "BLE_BOND",
-                            DiagnosticSeverity.WARNING,
-                            "Remote peer bond transitioned to BOND_NONE"
+                            DiagnosticSeverity.INFO,
+                            "OS bond state is BOND_NONE for peer $peerAddr (app-level ECDH session unaffected)"
                         )
                     }
                 }
@@ -182,7 +225,7 @@ class BlePeripheralManager @Inject constructor(
                     repository.logEvent(
                         "BLE_BOND",
                         DiagnosticSeverity.WARNING,
-                        "Detected Android 16 ACTION_KEY_MISSING; peer bond key lost"
+                        "Detected Android 16+ ACTION_KEY_MISSING for peer $peerAddr"
                     )
                 }
             }
@@ -803,8 +846,8 @@ class BlePeripheralManager @Inject constructor(
                 when {
                     !RecorderService.isServiceRunning -> {
                         notificationHelper.postAlertNotification(
-                            "Device A requested recording",
-                            "Open AI Memory Recorder and tap Arm & Start Recording (Android restricts background mic FGS launch)."
+                            "Primary device requested recording",
+                            "Open Sunbo (Secondary mode) and tap Arm & Start Recording (Android restricts background mic FGS launch)."
                         )
                         AcknowledgementPayload(
                             commandId = envelope.commandId,
@@ -1083,6 +1126,8 @@ class BlePeripheralManager @Inject constructor(
             CommandType.PING -> {
                 val ping = runCatching { json.decodeFromString<PingPayload>(payloadText) }
                     .getOrDefault(PingPayload(now))
+                // Re-calibrate clock skew on authenticated PING so overnight NTP drift never causes EXPIRED rejections.
+                replayGuard.calibrateClockSkew(ping.clientTimeMs, now)
                 val resp = PingResponsePayload(
                     clientTimeMs = ping.clientTimeMs,
                     serverTimeMs = now,
@@ -1134,10 +1179,13 @@ class BlePeripheralManager @Inject constructor(
 
     private suspend fun buildDeviceInfoPayload(): DeviceInfoPayload {
         val dev = repository.ensureDeviceInitialized()
+        val appVersion = runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: "1.0.0"
         return DeviceInfoPayload(
             deviceId = dev.deviceId,
             deviceName = dev.deviceName,
-            firmwareVersion = BuildConfig.VERSION_NAME,
+            firmwareVersion = appVersion,
             protocolVersion = BleProtocolConstants.PROTOCOL_VERSION,
             pairedDeviceId = pairingStore.getPairedClientId(),
             l2capSupported = true,
@@ -1239,6 +1287,8 @@ class BlePeripheralManager @Inject constructor(
     private fun startStatusObserver() {
         statusPushJob?.cancel()
         statusPushJob = scope.launch {
+            // CRITICAL: distinctUntilChanged() MUST precede debounce(250L); otherwise high-frequency
+            // stateMachine emissions would continuously reset the debounce window and starve BLE pushes!
             combine(
                 stateMachine.snapshot,
                 repository.observePendingSyncCount(),
@@ -1246,6 +1296,7 @@ class BlePeripheralManager @Inject constructor(
             ) { snap, pending, settings ->
                 Triple(snap.recorderState, snap.sessionSegmentsCount to pending, settings.config.localOnlyPauseSync)
             }
+                .distinctUntilChanged()
                 .debounce(250L)
                 .collect {
                     val dev = connectedDevice ?: return@collect
@@ -1258,6 +1309,9 @@ class BlePeripheralManager @Inject constructor(
 
     private fun resetConnectionSession() {
         l2capSyncServer.closeChannel()
+        while (notifyQueue.tryReceive().isSuccess) {
+            // Drain stale frames from previous connection so fast reconnects never send old packets.
+        }
         connectedDevice = null
         negotiatedMtu = BleChunkFraming.MIN_ATT_MTU
         cccdSubscriptions.clear()
@@ -1269,6 +1323,9 @@ class BlePeripheralManager @Inject constructor(
         lastAuthChallengeElapsedMs.set(0L)
         pendingNotifyAck?.cancel()
         pendingNotifyAck = null
+        scope.launch {
+            runCatching { repository.resetInterruptedSyncItems() }
+        }
     }
 
     private fun hasBleServerPermissions(): Boolean {
@@ -1285,6 +1342,7 @@ class BlePeripheralManager @Inject constructor(
     private fun registerBondReceiver() {
         if (receiverRegistered) return
         val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED).apply {
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             if (Build.VERSION.SDK_INT >= 36) {
                 addAction(BluetoothDevice.ACTION_KEY_MISSING)
             }

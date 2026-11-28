@@ -116,6 +116,9 @@ interface AudioSegmentDao {
     @Query("UPDATE audio_segments SET uploadStatus = :status WHERE segmentId = :segmentId")
     suspend fun updateUploadStatus(segmentId: String, status: UploadStatus)
 
+    @Query("UPDATE audio_segments SET uploadStatus = 'QUEUED' WHERE uploadStatus = 'IN_PROGRESS'")
+    suspend fun resetInProgressToQueued()
+
     @Query("DELETE FROM audio_segments WHERE segmentId = :segmentId")
     suspend fun deleteSegment(segmentId: String)
 
@@ -154,6 +157,9 @@ interface SyncQueueDao {
         bytesTransferred: Long,
         nowMs: Long
     )
+
+    @Query("UPDATE sync_queue SET syncStatus = 'PENDING' WHERE syncStatus = 'SENDING'")
+    suspend fun resetSendingToPending()
 
     @Query("DELETE FROM sync_queue")
     suspend fun deleteAll()

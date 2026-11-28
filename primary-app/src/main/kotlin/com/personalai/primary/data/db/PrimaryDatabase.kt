@@ -127,7 +127,7 @@ data class SyncedSessionEntity(
     tableName = "synced_segments",
     indices = [
         Index(value = ["sessionId"]),
-        Index(value = ["sequenceNumber"], unique = true),
+        Index(value = ["sequenceNumber"]),
         Index(value = ["asrStatus"]),
         Index(value = ["startTimestampMs"]),
         Index(value = ["audioDeleted", "startTimestampMs"])
@@ -433,6 +433,9 @@ interface CommandAuditDao {
     @Query("SELECT * FROM command_audit ORDER BY sentAtMs DESC LIMIT :limit")
     fun observeRecent(limit: Int = 40): Flow<List<CommandAuditEntity>>
 
+    @Query("DELETE FROM command_audit WHERE commandId NOT IN (SELECT commandId FROM command_audit ORDER BY sentAtMs DESC LIMIT :keepCount)")
+    suspend fun pruneKeepingLatest(keepCount: Int = 500)
+
     @Query("DELETE FROM command_audit")
     suspend fun deleteAll()
 }
@@ -476,8 +479,53 @@ interface SyncedContentDao {
     @Query("SELECT COUNT(*) FROM synced_segments WHERE asrStatus = 'PENDING' OR asrStatus = 'PROCESSING'")
     fun observePendingAsrCount(): Flow<Int>
 
-    @Query("SELECT * FROM synced_segments WHERE audioDeleted = 0 AND asrStatus = 'COMPLETED' AND startTimestampMs < :cutoffMs ORDER BY startTimestampMs ASC")
+    @Query(
+        """
+        SELECT * FROM synced_segments
+        WHERE audioDeleted = 0
+          AND asrStatus = 'COMPLETED'
+          AND MAX(syncedAtMs, startTimestampMs) < :cutoffMs
+          AND EXISTS (
+              SELECT 1 FROM transcripts t
+              WHERE t.segmentId = synced_segments.segmentId
+                AND TRIM(t.text) != ''
+                AND t.text != '[Inaudible / No Speech Text]'
+          )
+        ORDER BY syncedAtMs ASC
+        """
+    )
     suspend fun getRetentionEligibleAudioSegments(cutoffMs: Long): List<SyncedSegmentEntity>
+
+    @Query(
+        """
+        SELECT * FROM synced_segments
+        WHERE audioDeleted = 0
+          AND asrStatus = 'COMPLETED'
+          AND EXISTS (
+              SELECT 1 FROM transcripts t
+              WHERE t.segmentId = synced_segments.segmentId
+                AND TRIM(t.text) != ''
+                AND t.text != '[Inaudible / No Speech Text]'
+          )
+        ORDER BY syncedAtMs ASC
+        """
+    )
+    suspend fun getAllVerifiedTranscribedAudioSegments(): List<SyncedSegmentEntity>
+
+    @Query(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM synced_segments s
+            INNER JOIN transcripts t ON t.segmentId = s.segmentId
+            WHERE s.segmentId = :segmentId
+              AND s.audioDeleted = 0
+              AND s.asrStatus = 'COMPLETED'
+              AND TRIM(t.text) != ''
+              AND t.text != '[Inaudible / No Speech Text]'
+        )
+        """
+    )
+    suspend fun isSegmentVerifiedTranscribed(segmentId: String): Boolean
 
     @Query("SELECT COUNT(*) FROM synced_segments WHERE audioDeleted = 0")
     fun observeActiveAudioChunkCount(): Flow<Int>
@@ -505,6 +553,29 @@ interface TranscriptDao {
 
     @Query("SELECT * FROM transcripts WHERE transcriptId = :id LIMIT 1")
     suspend fun getById(id: String): TranscriptEntity?
+
+    @Query("SELECT * FROM transcripts WHERE segmentId = :segmentId LIMIT 1")
+    suspend fun getBySegmentId(segmentId: String): TranscriptEntity?
+
+    @Query(
+        """
+        UPDATE transcripts
+        SET text = :text,
+            language = :language,
+            confidence = :confidence,
+            asrProvider = :asrProvider,
+            createdAtMs = :createdAtMs
+        WHERE transcriptId = :transcriptId
+        """
+    )
+    suspend fun updateInPlace(
+        transcriptId: String,
+        text: String,
+        language: String,
+        confidence: Float,
+        asrProvider: String,
+        createdAtMs: Long
+    )
 
     @Query("SELECT * FROM transcripts WHERE transcriptId IN (:ids)")
     suspend fun getByIds(ids: List<String>): List<TranscriptEntity>
@@ -680,7 +751,7 @@ interface MemoryDao {
         EmbeddingVectorEntity::class,
         AskAiAuditEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = true
 )
 @TypeConverters(PrimaryTypeConverters::class)
@@ -920,6 +991,15 @@ abstract class PrimaryDatabase : RoomDatabase() {
                 db.execSQL("CREATE INDEX IF NOT EXISTS `index_memory_items_isArchived_isPinned_sourceTimestampMs` ON `memory_items` (`isArchived`, `isPinned`, `sourceTimestampMs`)")
 
                 db.execSQL("ALTER TABLE `task_reminders` ADD COLUMN `priority` INTEGER NOT NULL DEFAULT 1")
+            }
+        }
+
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Replace global UNIQUE(sequenceNumber) with a non-unique index so re-pairing or
+                // resetting a Secondary recorder never silently drops segments whose sequence restarts at #1.
+                db.execSQL("DROP INDEX IF EXISTS `index_synced_segments_sequenceNumber`")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_synced_segments_sequenceNumber` ON `synced_segments` (`sequenceNumber`)")
             }
         }
     }

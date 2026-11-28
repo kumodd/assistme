@@ -23,6 +23,7 @@ import com.personalai.recorder.data.db.RecordingSessionEntity
 import com.personalai.recorder.data.prefs.RecorderAppSettings
 import com.personalai.recorder.data.prefs.RecorderPreferencesRepository
 import com.personalai.recorder.data.repo.RecorderRepository
+import com.personalai.recorder.domain.state.LiveMeterSnapshot
 import com.personalai.recorder.domain.state.RecorderEvent
 import com.personalai.recorder.domain.state.RecorderSnapshot
 import com.personalai.recorder.domain.state.RecorderStateMachine
@@ -39,6 +40,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -105,6 +108,9 @@ class RecorderViewModel @Inject constructor(
         StorageStateTuple(dev, latestSession, segments, count, bytes)
     }
 
+    // High-frequency live meter stream exposed separately so Status/Segment lists never recompose at 10-31 Hz.
+    val liveMeter: StateFlow<LiveMeterSnapshot> = stateMachine.liveMeter
+
     private val extraFlows = combine(
         repository.observePendingSyncCount(),
         repository.observeDiagnosticEvents(100),
@@ -112,8 +118,21 @@ class RecorderViewModel @Inject constructor(
         audioCaptureEngine.telemetry,
         _keystoreReady
     ) { pending, events, testRunning, telemetry, ksReady ->
-        ExtraStateTuple(pending, events, testRunning, telemetry, ksReady)
-    }
+        // Only propagate live audio telemetry through the main UI state during explicit Mic Test,
+        // otherwise keep structural telemetry only (overruns / silenced / VAD backend) to eliminate flicker.
+        val stableTelemetry = if (testRunning) {
+            telemetry
+        } else {
+            LiveAudioTelemetry(
+                isClientSilenced = telemetry.isClientSilenced,
+                inputDeviceName = telemetry.inputDeviceName,
+                bufferOverrunCount = telemetry.bufferOverrunCount,
+                vadBackendLabel = telemetry.vadBackendLabel,
+                vadFallbackReason = telemetry.vadFallbackReason
+            )
+        }
+        ExtraStateTuple(pending, events, testRunning, stableTelemetry, ksReady)
+    }.distinctUntilChanged()
 
     val uiState: StateFlow<RecorderUiState> = combine(
         coreFlows,
@@ -154,9 +173,21 @@ class RecorderViewModel @Inject constructor(
     init {
         viewModelScope.launch(Dispatchers.IO) {
             repository.reconcileUncleanShutdownIfAny(RecorderService.isServiceRunning)
+            repository.resetInterruptedSyncItems()
+            repository.pruneOldDiagnosticEvents()
             val initialized = runCatching { repository.ensureDeviceInitialized() }.isSuccess
             _keystoreReady.value = initialized && masterKeyProvider.isHardwareBackedKeyReady()
             refreshPermissionsAndHealth()
+
+            // Auto-start BLE GATT host whenever Secondary is paired and hosting is desired.
+            val currentSettings = runCatching { prefs.settingsFlow.first() }.getOrNull()
+            if (currentSettings?.onboardingCompleted == true &&
+                currentSettings.bleHostDesired &&
+                pairingCredentialsStore.getMasterKeyBytes() != null &&
+                !BlePeripheralService.isHostRunning
+            ) {
+                runCatching { BlePeripheralService.start(getApplication()) }
+            }
         }
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -244,6 +275,10 @@ class RecorderViewModel @Inject constructor(
             return
         }
         RecorderService.startArmed(getApplication())
+        // Ensure BLE GATT server is also running while recording so Primary can auto-sync new segments live.
+        if (!BlePeripheralService.isHostRunning && pairingCredentialsStore.getMasterKeyBytes() != null) {
+            runCatching { BlePeripheralService.start(getApplication()) }
+        }
     }
 
     fun emergencyStop() {
@@ -307,6 +342,22 @@ class RecorderViewModel @Inject constructor(
 
     fun stopBleHost() {
         BlePeripheralService.stop(getApplication())
+    }
+
+    /**
+     * Safely halts active mic capture, mic test, and BLE GATT peripheral hosting before switching
+     * this phone from Secondary Recorder mode to Primary (2nd Mind) mode. Stored encrypted audio
+     * segments remain preserved on disk.
+     */
+    fun prepareForRoleSwitch() {
+        stopMicTest()
+        if (RecorderService.isServiceRunning) {
+            RecorderService.stopEmergency(getApplication())
+        }
+        if (BlePeripheralService.isHostRunning) {
+            BlePeripheralService.stop(getApplication())
+        }
+        pairingCredentialsStore.closePairingWindow()
     }
 
     fun togglePairingWindow(open: Boolean) {

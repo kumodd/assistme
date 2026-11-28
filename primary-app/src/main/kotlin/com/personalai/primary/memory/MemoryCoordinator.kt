@@ -456,6 +456,50 @@ class MemoryCoordinator @Inject constructor(
         memoryDao.updateTaskPriority(taskId, priority.coerceIn(0, 2))
     }
 
+    suspend fun createManualTask(
+        title: String,
+        notes: String = "",
+        dueLabel: String? = null,
+        priority: Int = 1
+    ): Result<TaskReminderEntity> = runCatching {
+        val cleanTitle = title.trim()
+        require(cleanTitle.isNotEmpty()) { "Task title cannot be empty." }
+        val now = System.currentTimeMillis()
+        val task = TaskReminderEntity(
+            taskId = UUID.randomUUID().toString(),
+            memoryId = null,
+            sourceTranscriptId = "manual_task_$now",
+            title = cleanTitle,
+            notes = notes.trim(),
+            dueAtMs = null,
+            dueLabel = dueLabel?.trim()?.takeIf { it.isNotEmpty() },
+            status = TaskReminderStatus.OPEN,
+            notificationScheduled = false,
+            createdAtMs = now,
+            priority = priority.coerceIn(0, 2)
+        )
+        memoryDao.insertTasks(listOf(task))
+        task
+    }
+
+    suspend fun editTask(
+        existing: TaskReminderEntity,
+        title: String,
+        notes: String,
+        dueLabel: String?,
+        priority: Int
+    ) {
+        val cleanTitle = title.trim()
+        if (cleanTitle.isEmpty()) return
+        val updated = existing.copy(
+            title = cleanTitle,
+            notes = notes.trim(),
+            dueLabel = dueLabel?.trim()?.takeIf { it.isNotEmpty() },
+            priority = priority.coerceIn(0, 2)
+        )
+        memoryDao.insertTasks(listOf(updated))
+    }
+
     suspend fun archiveMemory(memoryId: String) {
         memoryDao.archiveMemory(memoryId, System.currentTimeMillis())
     }

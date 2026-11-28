@@ -38,7 +38,9 @@ data class LiveAudioTelemetry(
     val vadProbability: Float = 0f,
     val isClientSilenced: Boolean = false,
     val inputDeviceName: String = "Default Mic",
-    val bufferOverrunCount: Long = 0L
+    val bufferOverrunCount: Long = 0L,
+    val vadBackendLabel: String = "Silero ONNX",
+    val vadFallbackReason: String? = null
 )
 
 sealed interface CaptureEvent {
@@ -52,6 +54,7 @@ sealed interface CaptureEvent {
     data class SilencedChanged(val isSilenced: Boolean, val sourceDesc: String) : CaptureEvent
     data class InputDeviceChanged(val deviceName: String) : CaptureEvent
     data class CaptureError(val code: Int, val message: String) : CaptureEvent
+    data class VadFallback(val reason: String) : CaptureEvent
     data object OverrunDetected : CaptureEvent
 }
 
@@ -80,12 +83,24 @@ class AudioCaptureEngine @Inject constructor(
     private fun createVadEngine(sampleRateHz: Int): VadEngine {
         return try {
             val modelBytes = context.assets.open("models/silero_vad.onnx").use { it.readBytes() }
-            SileroOnnxVadEngine(
+            val engine = SileroOnnxVadEngine(
                 modelBytes = modelBytes,
                 sampleRateHz = sampleRateHz,
                 frameSizeSamples = if (sampleRateHz == 16_000) 512 else 256
             )
-        } catch (_: Throwable) {
+            _telemetry.value = _telemetry.value.copy(
+                vadBackendLabel = "Silero ONNX",
+                vadFallbackReason = null
+            )
+            engine
+        } catch (t: Throwable) {
+            val reason = "${t.javaClass.simpleName}: ${t.message ?: "unknown ONNX error"}"
+            android.util.Log.e("AudioCaptureEngine", "Silero ONNX VAD load failed; falling back to Energy VAD: $reason", t)
+            _telemetry.value = _telemetry.value.copy(
+                vadBackendLabel = "Energy Fallback",
+                vadFallbackReason = reason
+            )
+            _events.tryEmit(CaptureEvent.VadFallback(reason))
             EnergyFallbackVadEngine(
                 sampleRateHz = sampleRateHz,
                 frameSizeSamples = if (sampleRateHz == 16_000) 512 else 256
@@ -186,6 +201,7 @@ class AudioCaptureEngine @Inject constructor(
             val expectedFrameMs = (frameSizeSamples * 1000L) / sampleRateHz
             var overrunCount = 0L
             var lastReadElapsedMs = SystemClock.elapsedRealtime()
+            var lastTelemetryEmitMs = 0L
 
             try {
                 audioRecord.startRecording()
@@ -234,11 +250,15 @@ class AudioCaptureEngine @Inject constructor(
                         runCatching { engine.processFrame(frameBuffer) }.getOrDefault(0f)
                     }
 
-                    _telemetry.value = _telemetry.value.copy(
-                        audioLevelDb = db,
-                        vadProbability = prob,
-                        bufferOverrunCount = overrunCount
-                    )
+                    // Throttle live telemetry flow emissions to ~10 Hz (95ms) to prevent UI recomposition storms.
+                    if (nowElapsedMs - lastTelemetryEmitMs >= 95L) {
+                        lastTelemetryEmitMs = nowElapsedMs
+                        _telemetry.value = _telemetry.value.copy(
+                            audioLevelDb = db,
+                            vadProbability = prob,
+                            bufferOverrunCount = overrunCount
+                        )
+                    }
 
                     if (!isSilenced) {
                         _events.tryEmit(

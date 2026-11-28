@@ -12,6 +12,10 @@ import com.personalai.primary.data.db.SyncedSegmentEntity
 import com.personalai.primary.data.db.TaskReminderEntity
 import com.personalai.primary.data.db.TaskReminderStatus
 import com.personalai.primary.data.db.TranscriptEntity
+import com.personalai.primary.ui.screens.formatHumanEnum
+import com.personalai.primary.ui.screens.formatStorageBytes
+import com.personalai.primary.ui.screens.formatThermalStatusLabel
+import com.personalai.primary.ui.screens.parseSimpleMarkdown
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -23,11 +27,18 @@ import java.util.concurrent.TimeUnit
 class SecondMindProductivityTest {
 
     @Test
-    fun `audio retention policies calculate exact 1, 3, and 5 day cutoffs and null for Keep Forever`() {
+    fun `audio retention policies calculate exact immediate, hourly, and daily cutoffs and null for Keep Forever`() {
         val nowMs = 1_760_000_000_000L
+        assertTrue(AudioRetentionPolicy.AFTER_TRANSCRIPTION.isImmediateAfterTranscription)
+        assertEquals(nowMs, AudioRetentionPolicy.AFTER_TRANSCRIPTION.cutoffTimestampMs(nowMs))
+        assertEquals(nowMs - TimeUnit.HOURS.toMillis(1), AudioRetentionPolicy.HOURS_1.cutoffTimestampMs(nowMs))
+        assertEquals(nowMs - TimeUnit.HOURS.toMillis(6), AudioRetentionPolicy.HOURS_6.cutoffTimestampMs(nowMs))
+        assertEquals(nowMs - TimeUnit.HOURS.toMillis(12), AudioRetentionPolicy.HOURS_12.cutoffTimestampMs(nowMs))
         assertEquals(nowMs - TimeUnit.DAYS.toMillis(1), AudioRetentionPolicy.DAYS_1.cutoffTimestampMs(nowMs))
         assertEquals(nowMs - TimeUnit.DAYS.toMillis(3), AudioRetentionPolicy.DAYS_3.cutoffTimestampMs(nowMs))
         assertEquals(nowMs - TimeUnit.DAYS.toMillis(5), AudioRetentionPolicy.DAYS_5.cutoffTimestampMs(nowMs))
+        assertEquals(nowMs - TimeUnit.DAYS.toMillis(7), AudioRetentionPolicy.DAYS_7.cutoffTimestampMs(nowMs))
+        assertFalse(AudioRetentionPolicy.DAYS_3.isImmediateAfterTranscription)
         assertNull(AudioRetentionPolicy.KEEP_FOREVER.cutoffTimestampMs(nowMs))
     }
 
@@ -120,5 +131,31 @@ class SecondMindProductivityTest {
         assertEquals("Today", snap.weeklyBuckets.last().dayLabel)
         assertEquals(3, snap.languageBreakdown.size)
         assertEquals(listOf("Patna"), snap.cleanTopEntities.map { it.name })
+    }
+
+    @Test
+    fun `markdown parser and UI label formatters strip syntax cleanly and format human labels`() {
+        val md = parseSimpleMarkdown(
+            """
+            ### Focus Themes
+            - **Ship v2** with `raw WAV` upload [S1]
+            - [ ] Call Mummy *tonight*
+            - [x] Verify 16 KB alignment
+            """.trimIndent()
+        )
+        val rendered = md.text
+        assertTrue(rendered.contains("Focus Themes"))
+        assertFalse(rendered.contains("###"))
+        assertFalse(rendered.contains("**"))
+        assertTrue(rendered.contains("• Ship v2 with raw WAV upload [S1]"))
+        assertTrue(rendered.contains("○ Call Mummy tonight"))
+        assertTrue(rendered.contains("✓ Verify 16 KB alignment"))
+        assertTrue("Bold/citation/code spans should be applied", md.spanStyles.size >= 3)
+
+        assertEquals("Nominal", formatThermalStatusLabel(0))
+        assertEquals("Severe", formatThermalStatusLabel(3))
+        assertEquals("Active Listening", formatHumanEnum("ACTIVE_LISTENING"))
+        assertEquals("< 1 KB", formatStorageBytes(512L))
+        assertEquals("0 KB", formatStorageBytes(0L))
     }
 }

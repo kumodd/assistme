@@ -1,5 +1,4 @@
 <resources>
-    <string name="app_name">2nd Mind Recorder</string>
     <string name="notif_channel_recorder">Recorder Status</string>
     <string name="notif_channel_recorder_desc">Persistent microphone capture indicator and emergency stop control</string>
     <string name="notif_channel_alerts">Recorder Alerts</string>

@@ -1,7 +1,5 @@
-import java.util.Properties
-
 plugins {
-    alias(libs.plugins.android.application)
+    alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
@@ -9,83 +7,14 @@ plugins {
     alias(libs.plugins.hilt)
 }
 
-val keystorePropsFile = rootProject.file("keystore.properties")
-val keystoreProps = Properties().apply {
-    if (keystorePropsFile.exists()) {
-        keystorePropsFile.inputStream().use { load(it) }
-    }
-}
-
-val enableAbiSplits = project.findProperty("enableAbiSplits")?.toString()?.toBoolean() == true
-
 android {
     namespace = "com.personalai.recorder"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.personalai.recorder"
         minSdk = 29
-        targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-    }
-
-    signingConfigs {
-        create("release") {
-            val storePath = keystoreProps.getProperty("storeFile") ?: System.getenv("SECONDMIND_STORE_FILE")
-            if (!storePath.isNullOrBlank()) {
-                storeFile = rootProject.file(storePath)
-                storePassword = keystoreProps.getProperty("storePassword") ?: System.getenv("SECONDMIND_STORE_PASSWORD")
-                keyAlias = keystoreProps.getProperty("keyAlias") ?: System.getenv("SECONDMIND_KEY_ALIAS")
-                keyPassword = keystoreProps.getProperty("keyPassword") ?: System.getenv("SECONDMIND_KEY_PASSWORD")
-            }
-        }
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = true
-            isShrinkResources = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
-            // Keep ARM mobile ABIs only for Play Store release; Play splits deliver a single ABI per device (~25-30 MB).
-            if (!enableAbiSplits) {
-                ndk {
-                    abiFilters += listOf("arm64-v8a", "armeabi-v7a")
-                }
-            }
-            if (signingConfigs.getByName("release").storeFile?.exists() == true) {
-                signingConfig = signingConfigs.getByName("release")
-            }
-        }
-    }
-
-    bundle {
-        abi {
-            enableSplit = true
-        }
-        density {
-            enableSplit = true
-        }
-        language {
-            enableSplit = true
-        }
-    }
-
-    // Optional standalone per-ABI APK splits when building with -PenableAbiSplits=true
-    if (enableAbiSplits) {
-        splits {
-            abi {
-                isEnable = true
-                reset()
-                include("arm64-v8a", "armeabi-v7a")
-                isUniversalApk = false
-            }
-        }
+        consumerProguardFiles("proguard-rules.pro")
     }
 
     compileOptions {

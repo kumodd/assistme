@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.SystemClock
 import androidx.core.app.ServiceCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
@@ -56,6 +57,8 @@ class RecorderService : LifecycleService() {
     private var monitorJob: Job? = null
     private var currentConfig: RecorderConfigPayload = RecorderConfigPayload()
     private val stopping = AtomicBoolean(false)
+    @Volatile
+    private var lastNotificationUpdateMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -98,7 +101,7 @@ class RecorderService : LifecycleService() {
             stateMachine.dispatch(RecorderEvent.PermissionsMissing)
             notificationHelper.postAlertNotification(
                 "Microphone permission required",
-                "Open AI Memory Recorder to grant microphone permission before recording."
+                "Open Sunbo (Secondary mode) to grant microphone permission before recording."
             )
             stopSelf()
             return
@@ -409,6 +412,14 @@ class RecorderService : LifecycleService() {
                         )
                     }
 
+                    is CaptureEvent.VadFallback -> {
+                        repository.logEvent(
+                            "VAD_FALLBACK",
+                            DiagnosticSeverity.ERROR,
+                            "Silero ONNX VAD unavailable; using Energy Fallback (${event.reason})"
+                        )
+                    }
+
                     is CaptureEvent.CaptureError -> {
                         repository.logEvent(
                             "AUDIO_ERROR",
@@ -523,7 +534,10 @@ class RecorderService : LifecycleService() {
         }
     }
 
-    private fun refreshNotification() {
+    private fun refreshNotification(force: Boolean = false) {
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - lastNotificationUpdateMs < 500L) return
+        lastNotificationUpdateMs = now
         val snap = stateMachine.snapshot.value
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(
@@ -539,6 +553,7 @@ class RecorderService : LifecycleService() {
     override fun onDestroy() {
         isServiceRunning = false
         audioCaptureEngine.stopCapture()
+        stateMachine.resetLiveMeter()
         super.onDestroy()
     }
 

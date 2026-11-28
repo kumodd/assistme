@@ -32,7 +32,8 @@ object PrimaryModule {
             .addMigrations(
                 PrimaryDatabase.MIGRATION_1_2,
                 PrimaryDatabase.MIGRATION_2_3,
-                PrimaryDatabase.MIGRATION_3_4
+                PrimaryDatabase.MIGRATION_3_4,
+                PrimaryDatabase.MIGRATION_4_5
             )
             .build()
     }

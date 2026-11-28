@@ -13,7 +13,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.personalai.protocol.RecorderState
-import com.personalai.recorder.MainActivity
 import com.personalai.recorder.R
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
@@ -52,6 +51,16 @@ class NotificationHelper @Inject constructor(
         nm.createNotificationChannel(alertsChannel)
     }
 
+    private fun createLaunchAppIntent(): Intent {
+        return context.packageManager.getLaunchIntentForPackage(context.packageName)?.apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        } ?: Intent(Intent.ACTION_MAIN).apply {
+            setPackage(context.packageName)
+            addCategory(Intent.CATEGORY_LAUNCHER)
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+    }
+
     fun buildRecorderNotification(
         state: RecorderState,
         segmentCount: Int,
@@ -60,9 +69,7 @@ class NotificationHelper @Inject constructor(
         val openAppIntent = PendingIntent.getActivity(
             context,
             1,
-            Intent(context, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
+            createLaunchAppIntent(),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -121,7 +128,7 @@ class NotificationHelper @Inject constructor(
         val openAppIntent = PendingIntent.getActivity(
             context,
             3,
-            Intent(context, MainActivity::class.java),
+            createLaunchAppIntent(),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -142,9 +149,7 @@ class NotificationHelper @Inject constructor(
         val openAppIntent = PendingIntent.getActivity(
             context,
             4,
-            Intent(context, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
+            createLaunchAppIntent(),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 

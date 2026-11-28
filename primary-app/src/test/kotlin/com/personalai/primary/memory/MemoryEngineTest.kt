@@ -222,6 +222,26 @@ class MemoryEngineTest {
             items.add(transcript)
         }
         override suspend fun getById(id: String) = items.find { it.transcriptId == id }
+        override suspend fun getBySegmentId(segmentId: String) = items.find { it.segmentId == segmentId }
+        override suspend fun updateInPlace(
+            transcriptId: String,
+            text: String,
+            language: String,
+            confidence: Float,
+            asrProvider: String,
+            createdAtMs: Long
+        ) {
+            val idx = items.indexOfFirst { it.transcriptId == transcriptId }
+            if (idx >= 0) {
+                items[idx] = items[idx].copy(
+                    text = text,
+                    language = language,
+                    confidence = confidence,
+                    asrProvider = asrProvider,
+                    createdAtMs = createdAtMs
+                )
+            }
+        }
         override suspend fun getByIds(ids: List<String>) = items.filter { it.transcriptId in ids }
         override fun observeRecentTranscripts(limit: Int): Flow<List<TranscriptEntity>> = flowOf(items.take(limit))
         override suspend fun getRecentTranscripts(limit: Int) = items.sortedByDescending { it.startTimeMs }.take(limit)

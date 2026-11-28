@@ -105,7 +105,7 @@ object OfflineSpeechLanguageResolver {
         }
 
         when (mode) {
-            AsrLanguageMode.AUTO -> {
+            AsrLanguageMode.AUTO, AsrLanguageMode.HINGLISH -> {
                 addInstalledIfPresent("en-IN")
                 if (deviceIsEn) addInstalledIfPresent(deviceNorm)
                 addInstalledIfPresent("en-US")
@@ -142,7 +142,7 @@ object OfflineSpeechLanguageResolver {
         }
 
         // Only enable API 34 multi-language detection when BOTH an installed English AND an installed Hindi pack exist.
-        val allowedDetection = if (mode == AsrLanguageMode.AUTO) {
+        val allowedDetection = if (mode == AsrLanguageMode.AUTO || mode == AsrLanguageMode.HINGLISH) {
             val primaryEn = listOfNotNull(
                 installedByKey["en-in"],
                 if (deviceIsEn) installedByKey[deviceKey] else null,
@@ -184,7 +184,7 @@ object OfflineSpeechLanguageResolver {
         }
 
         when (mode) {
-            AsrLanguageMode.AUTO -> {
+            AsrLanguageMode.AUTO, AsrLanguageMode.HINGLISH -> {
                 if (deviceIsEn) {
                     maybeAddMissing("en-IN", deviceNorm, "en-US", "en-GB")
                 } else {
@@ -232,7 +232,7 @@ object OfflineSpeechLanguageResolver {
                 }
             }
 
-            AsrLanguageMode.AUTO -> {
+            AsrLanguageMode.AUTO, AsrLanguageMode.HINGLISH -> {
                 if (candidates.isNotEmpty()) {
                     missingPreferred.firstOrNull()
                 } else if (supportedByKey.isNotEmpty()) {
@@ -261,7 +261,7 @@ object OfflineSpeechLanguageResolver {
         val raw = when (mode) {
             AsrLanguageMode.HINDI -> listOf("hi-IN", deviceNorm, "en-US", "en-IN")
             AsrLanguageMode.ENGLISH -> listOf(deviceNorm, "en-US", "en-IN", "en-GB")
-            AsrLanguageMode.AUTO -> listOf(deviceNorm, "en-US", "en-IN", "en-GB", "hi-IN")
+            AsrLanguageMode.AUTO, AsrLanguageMode.HINGLISH -> listOf(deviceNorm, "en-US", "en-IN", "en-GB", "hi-IN")
         }
         val seen = LinkedHashSet<String>()
         val result = mutableListOf<String>()
@@ -279,7 +279,7 @@ object OfflineSpeechLanguageResolver {
         val deviceIsEn = deviceNorm.lowercase(Locale.ROOT).let { it == "en" || it.startsWith("en-") }
         return when (mode) {
             AsrLanguageMode.HINDI -> "hi-IN"
-            AsrLanguageMode.ENGLISH, AsrLanguageMode.AUTO -> if (deviceIsEn) deviceNorm else "en-US"
+            AsrLanguageMode.ENGLISH, AsrLanguageMode.AUTO, AsrLanguageMode.HINGLISH -> if (deviceIsEn) deviceNorm else "en-US"
         }
     }
 }

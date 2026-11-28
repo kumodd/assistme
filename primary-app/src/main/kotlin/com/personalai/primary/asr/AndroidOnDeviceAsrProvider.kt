@@ -16,8 +16,9 @@ import android.util.Log
 import androidx.annotation.RequiresApi
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -543,130 +544,154 @@ class AndroidOnDeviceAsrProvider @Inject constructor(
 
         var recognizer: SpeechRecognizer? = null
         try {
-            val writerJob = withContext(Dispatchers.Main) {
-                recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
-                recognizer!!.setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) = Unit
-                    override fun onBeginningOfSpeech() = Unit
-                    override fun onRmsChanged(rmsdB: Float) = Unit
-                    override fun onBufferReceived(buffer: ByteArray?) = Unit
-                    override fun onEndOfSpeech() = Unit
-                    override fun onEvent(eventType: Int, params: Bundle?) = Unit
+            return coroutineScope {
+                withContext(Dispatchers.Main) {
+                    recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
+                    recognizer!!.setRecognitionListener(object : RecognitionListener {
+                        override fun onReadyForSpeech(params: Bundle?) = Unit
+                        override fun onBeginningOfSpeech() = Unit
+                        override fun onRmsChanged(rmsdB: Float) = Unit
+                        override fun onBufferReceived(buffer: ByteArray?) = Unit
+                        override fun onEndOfSpeech() = Unit
+                        override fun onEvent(eventType: Int, params: Bundle?) = Unit
 
-                    override fun onPartialResults(partialResults: Bundle?) {
-                        val partial = partialResults
-                            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            ?.firstOrNull()
-                            ?.trim()
-                            .orEmpty()
-                        if (partial.isNotBlank()) {
-                            latestPartialText = partial
-                            Log.d(TAG, "onPartial seg=${request.segmentId}: '${partial.take(80)}'")
+                        override fun onPartialResults(partialResults: Bundle?) {
+                            val partial = partialResults
+                                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                ?.firstOrNull()
+                                ?.trim()
+                                .orEmpty()
+                            if (partial.isNotBlank()) {
+                                latestPartialText = partial
+                                Log.d(TAG, "onPartial seg=${request.segmentId}: '${partial.take(80)}'")
+                            }
                         }
-                    }
 
-                    override fun onLanguageDetection(results: Bundle) {
-                        latestDetectedLang = results.getString(SpeechRecognizer.DETECTED_LANGUAGE)
-                        Log.d(TAG, "onLanguageDetection seg=${request.segmentId}: $latestDetectedLang")
-                    }
-
-                    override fun onSegmentResults(segmentResults: Bundle) {
-                        collectBundle(segmentResults, "onSegmentResults")
-                    }
-
-                    override fun onEndOfSegmentedSession() {
-                        Log.d(TAG, "onEndOfSegmentedSession seg=${request.segmentId} pack=$languageTag")
-                        if (!completion.isCompleted) {
-                            completion.complete(buildFinalSuccess())
+                        override fun onLanguageDetection(results: Bundle) {
+                            latestDetectedLang = results.getString(SpeechRecognizer.DETECTED_LANGUAGE)
+                            Log.d(TAG, "onLanguageDetection seg=${request.segmentId}: $latestDetectedLang")
                         }
-                    }
 
-                    override fun onError(error: Int) {
-                        Log.w(TAG, "onError seg=${request.segmentId} pack=$languageTag code=$error collected=${segmentTexts.size} partial='${latestPartialText.take(60)}'")
-                        if (completion.isCompleted) return
-                        if (segmentTexts.isNotEmpty() || latestPartialText.isNotBlank()) {
-                            completion.complete(buildFinalSuccess())
-                            return
+                        override fun onSegmentResults(segmentResults: Bundle) {
+                            collectBundle(segmentResults, "onSegmentResults")
                         }
-                        if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-                            completion.complete(buildFinalSuccess())
-                            return
+
+                        override fun onEndOfSegmentedSession() {
+                            Log.d(TAG, "onEndOfSegmentedSession seg=${request.segmentId} pack=$languageTag")
+                            if (!completion.isCompleted) {
+                                completion.complete(buildFinalSuccess())
+                            }
                         }
-                        when (error) {
-                            SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ->
-                                completion.complete(
-                                    Result.failure(
-                                        LanguagePackUnavailableException(
-                                            languageTag = languageTag,
-                                            errorCode = error,
-                                            message = "Offline language pack not installed ($languageTag)"
+
+                        override fun onError(error: Int) {
+                            Log.w(TAG, "onError seg=${request.segmentId} pack=$languageTag code=$error collected=${segmentTexts.size} partial='${latestPartialText.take(60)}'")
+                            if (completion.isCompleted) return
+                            if (segmentTexts.isNotEmpty() || latestPartialText.isNotBlank()) {
+                                completion.complete(buildFinalSuccess())
+                                return
+                            }
+                            if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                                completion.complete(buildFinalSuccess())
+                                return
+                            }
+                            when (error) {
+                                SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ->
+                                    completion.complete(
+                                        Result.failure(
+                                            LanguagePackUnavailableException(
+                                                languageTag = languageTag,
+                                                errorCode = error,
+                                                message = "Offline language pack not installed ($languageTag)"
+                                            )
                                         )
                                     )
-                                )
-                            SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ->
-                                completion.complete(
-                                    Result.failure(
-                                        LanguagePackUnavailableException(
-                                            languageTag = languageTag,
-                                            errorCode = error,
-                                            message = "Offline language pack unavailable ($languageTag)"
+                                SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ->
+                                    completion.complete(
+                                        Result.failure(
+                                            LanguagePackUnavailableException(
+                                                languageTag = languageTag,
+                                                errorCode = error,
+                                                message = "Offline language pack unavailable ($languageTag)"
+                                            )
                                         )
                                     )
-                                )
-                            else ->
-                                completion.complete(Result.failure(IllegalStateException("On-device ASR error code=$error")))
+                                SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+                                SpeechRecognizer.ERROR_SERVER_DISCONNECTED,
+                                SpeechRecognizer.ERROR_CLIENT,
+                                SpeechRecognizer.ERROR_AUDIO ->
+                                    completion.complete(
+                                        Result.failure(
+                                            TransientAsrException(
+                                                errorCode = error,
+                                                message = describeSpeechError(error)
+                                            )
+                                        )
+                                    )
+                                else ->
+                                    completion.complete(
+                                        Result.failure(IllegalStateException(describeSpeechError(error)))
+                                    )
+                            }
+                        }
+
+                        override fun onResults(results: Bundle?) {
+                            collectBundle(results, "onResults")
+                            if (!completion.isCompleted) {
+                                completion.complete(buildFinalSuccess())
+                            }
+                        }
+                    })
+
+                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, languageTag)
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, readFd)
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16_000)
+                        putExtra(RecognizerIntent.EXTRA_SEGMENTED_SESSION, RecognizerIntent.EXTRA_AUDIO_SOURCE)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+                            allowedDetectionTags.size >= 2
+                        ) {
+                            putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true)
+                            putExtra(
+                                RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,
+                                ArrayList(allowedDetectionTags)
+                            )
                         }
                     }
-
-                    override fun onResults(results: Bundle?) {
-                        collectBundle(results, "onResults")
-                        if (!completion.isCompleted) {
-                            completion.complete(buildFinalSuccess())
-                        }
-                    }
-                })
-
-                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, languageTag)
-                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, readFd)
-                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
-                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
-                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16_000)
-                    putExtra(RecognizerIntent.EXTRA_SEGMENTED_SESSION, RecognizerIntent.EXTRA_AUDIO_SOURCE)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
-                        allowedDetectionTags.size >= 2
-                    ) {
-                        putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true)
-                        putExtra(
-                            RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,
-                            ArrayList(allowedDetectionTags)
-                        )
-                    }
+                    recognizer!!.startListening(intent)
                 }
-                recognizer!!.startListening(intent)
 
-                CoroutineScope(Dispatchers.IO).launch {
+                // Structured IO child job: prepends 250ms leading silence so Google SODA warms up before
+                // first syllable, paces short clips gently to prevent cold-start NO_MATCH, and appends 1.2s tail.
+                val writerJob = async(Dispatchers.IO) {
                     runCatching {
                         FileOutputStream(writeFd.fileDescriptor).use { out ->
-                            // Stream in 100ms (3200B) chunks with gentle pacing so SODA's audio pusher
-                            // decodes multi-sentence 30s clips cleanly without buffer overflow.
-                            val chunkBytes = 3_200
+                            val chunkBytes = 3_200 // 100ms at 16kHz 16-bit mono
+                            val silence = ByteArray(chunkBytes)
+                            val isShortClip = pcmLength < 128_000 // < 4.0s
+                            val chunkDelayMs = if (isShortClip) 12L else 6L
+
+                            // 300ms leading silence pad (prevents clipped first words & SODA warm-up drops)
+                            repeat(3) {
+                                out.write(silence)
+                                delay(chunkDelayMs)
+                            }
                             var pos = pcmOffset
                             val end = pcmOffset + pcmLength
                             while (pos < end) {
                                 val len = minOf(chunkBytes, end - pos)
                                 out.write(request.wavBytes, pos, len)
                                 pos += len
-                                delay(6L)
+                                delay(chunkDelayMs)
                             }
-                            // Append 1.0s trailing silence so the on-device endpointer flushes final words.
-                            val silence = ByteArray(3_200)
-                            repeat(10) {
+                            // 1.2s trailing silence flushes the on-device endpointer completely.
+                            repeat(12) {
                                 out.write(silence)
-                                delay(6L)
+                                delay(chunkDelayMs)
                             }
                             out.flush()
                         }
@@ -675,16 +700,16 @@ class AndroidOnDeviceAsrProvider @Inject constructor(
                     }
                     runCatching { writeFd.close() }
                 }
-            }
 
-            val result = withTimeoutOrNull(45_000L) { completion.await() }
-                ?: if (segmentTexts.isNotEmpty() || latestPartialText.isNotBlank()) {
-                    buildFinalSuccess()
-                } else {
-                    Result.failure(IllegalStateException("On-device ASR timed out"))
-                }
-            writerJob.cancel()
-            return result
+                val result = withTimeoutOrNull(45_000L) { completion.await() }
+                    ?: if (segmentTexts.isNotEmpty() || latestPartialText.isNotBlank()) {
+                        buildFinalSuccess()
+                    } else {
+                        Result.failure(TransientAsrException(-1, "On-device ASR timed out"))
+                    }
+                writerJob.cancel()
+                result
+            }
         } finally {
             runCatching { readFd.close() }
             runCatching { writeFd.close() }
@@ -712,8 +737,25 @@ class AndroidOnDeviceAsrProvider @Inject constructor(
         return 44
     }
 
+    private fun describeSpeechError(code: Int): String = when (code) {
+        SpeechRecognizer.ERROR_AUDIO -> "On-device ASR audio stream error (code=$code)"
+        SpeechRecognizer.ERROR_CLIENT -> "On-device ASR client interrupted (code=$code)"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Speech service missing permission (code=$code)"
+        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Speech service attempted network unexpectedly (code=$code)"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "On-device speech recognizer busy (code=$code)"
+        SpeechRecognizer.ERROR_SERVER -> "On-device speech service internal error (code=$code)"
+        SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> "Too many rapid speech recognition requests (code=$code)"
+        SpeechRecognizer.ERROR_SERVER_DISCONNECTED -> "On-device speech service disconnected (code=$code)"
+        else -> "On-device ASR error code=$code"
+    }
+
     private class LanguagePackUnavailableException(
         val languageTag: String,
+        val errorCode: Int,
+        message: String
+    ) : IllegalStateException(message)
+
+    class TransientAsrException(
         val errorCode: Int,
         message: String
     ) : IllegalStateException(message)

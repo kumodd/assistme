@@ -1,7 +1,7 @@
 package com.personalai.recorder.data.repo
 
+import android.content.Context
 import android.os.Build
-import com.personalai.recorder.BuildConfig
 import com.personalai.recorder.audio.CompletedSpeechSegment
 import com.personalai.recorder.data.db.AudioSegmentDao
 import com.personalai.recorder.data.db.AudioSegmentEntity
@@ -22,6 +22,7 @@ import com.personalai.recorder.domain.state.RecorderEvent
 import com.personalai.recorder.domain.state.RecorderStateMachine
 import com.personalai.recorder.security.EncryptedSegmentStorage
 import com.personalai.recorder.security.MasterKeyProvider
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import java.util.UUID
@@ -30,6 +31,7 @@ import javax.inject.Singleton
 
 @Singleton
 class RecorderRepository @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val deviceDao: RecorderDeviceDao,
     private val sessionDao: SessionDao,
     private val segmentDao: AudioSegmentDao,
@@ -55,10 +57,14 @@ class RecorderRepository @Inject constructor(
         val existing = deviceDao.getDevice()
         if (existing != null) return existing
 
+        val appVersion = runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: "1.0.0"
+
         val created = RecorderDeviceEntity(
             deviceId = UUID.randomUUID().toString(),
             deviceName = "${Build.MANUFACTURER} ${Build.MODEL}",
-            firmwareVersion = BuildConfig.VERSION_NAME,
+            firmwareVersion = appVersion,
             createdAt = System.currentTimeMillis()
         )
         deviceDao.upsertDevice(created)
@@ -241,10 +247,24 @@ class RecorderRepository @Inject constructor(
     }
 
     suspend fun getPendingSyncBatch(cursorSequence: Long, maxBatch: Int): List<AudioSegmentEntity> {
+        val highest = segmentDao.getMaxSequenceNumber()
+        // If Primary holds a stale cursor from a prior/wiped Secondary, reset effective cursor to 0
+        // so un-ACKed segments are never skipped.
+        val effectiveCursor = if (cursorSequence > highest) 0L else cursorSequence.coerceAtLeast(0L)
         return segmentDao.getPendingSegmentsAfter(
-            cursorSequence = cursorSequence.coerceAtLeast(0L),
+            cursorSequence = effectiveCursor,
             limit = maxBatch.coerceIn(1, 50)
         )
+    }
+
+    suspend fun resetInterruptedSyncItems() {
+        segmentDao.resetInProgressToQueued()
+        syncQueueDao.resetSendingToPending()
+    }
+
+    suspend fun pruneOldDiagnosticEvents(maxAgeDays: Long = 7L) {
+        val cutoff = System.currentTimeMillis() - (maxAgeDays * 24L * 60L * 60L * 1000L)
+        diagnosticDao.pruneOlderThan(cutoff)
     }
 
     suspend fun readDecryptedSegmentWavForSync(segmentId: String): Result<ByteArray> {

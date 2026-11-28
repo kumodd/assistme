@@ -1,5 +1,6 @@
 package com.personalai.primary.ui
 
+import android.content.Context
 import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -9,6 +10,7 @@ import com.personalai.primary.asr.AsrProgressSnapshot
 import com.personalai.primary.asr.AsrProviderType
 import com.personalai.primary.asr.OfflineSpeechPackStatus
 import com.personalai.primary.asr.TranscriptionCoordinator
+import com.personalai.primary.asr.UoaiAsrScript
 import com.personalai.primary.audio.AudioExportManager
 import com.personalai.primary.audio.AudioPlaybackHelper
 import com.personalai.primary.audio.AudioRetentionManager
@@ -19,6 +21,7 @@ import com.personalai.primary.ble.BleScannerManager
 import com.personalai.primary.ble.CommandFeedback
 import com.personalai.primary.ble.DiscoveredRecorderDevice
 import com.personalai.primary.ble.PendingSasConfirmation
+import com.personalai.primary.data.db.AsrProcessingStatus
 import com.personalai.primary.data.db.AskAiAuditEntity
 import com.personalai.primary.data.db.CommandAuditDao
 import com.personalai.primary.data.db.CommandAuditEntity
@@ -45,14 +48,19 @@ import com.personalai.primary.memory.MemoryEngineStatusSnapshot
 import com.personalai.primary.memory.SearchFilter
 import com.personalai.primary.memory.SecondMindInsightsEngine
 import com.personalai.primary.memory.SecondMindInsightsSnapshot
+import com.personalai.primary.memory.uoai.UoaiAudioModelInfo
+import com.personalai.primary.memory.uoai.UoaiAudioProviderInfo
+import com.personalai.primary.memory.uoai.UoaiAudioStatusResponse
 import com.personalai.primary.memory.uoai.UoaiClient
 import com.personalai.primary.memory.uoai.UoaiConnectionState
 import com.personalai.primary.memory.uoai.UoaiRegistrationResult
 import com.personalai.primary.permissions.PrimaryPermissionManager
 import com.personalai.primary.permissions.PrimaryPermissionsSnapshot
 import com.personalai.primary.security.PrimaryEncryptedAudioStorage
+import com.personalai.primary.sync.PrimarySyncService
 import com.personalai.primary.sync.SyncManager
 import com.personalai.primary.sync.SyncProgressSnapshot
+import dagger.hilt.android.qualifiers.ApplicationContext
 import com.personalai.protocol.BatteryInfoPayload
 import com.personalai.protocol.BleConnectionState
 import com.personalai.protocol.DeviceInfoPayload
@@ -102,8 +110,10 @@ data class PrimaryUiState(
     val asrProgress: AsrProgressSnapshot = AsrProgressSnapshot(),
     val offlineSpeechPacks: OfflineSpeechPackStatus = OfflineSpeechPackStatus(),
     val segmentsWithTranscripts: List<SegmentWithTranscript> = emptyList(),
+    val spokenTranscriptIds: Set<String> = emptySet(),
     val totalSyncedCount: Int = 0,
     val pendingAsrCount: Int = 0,
+    val failedAsrCount: Int = 0,
     val activeAudioChunkCount: Int = 0,
     val activeAudioBytes: Long = 0L,
     val searchQuery: String = "",
@@ -133,6 +143,10 @@ data class PrimaryUiState(
     val highlightedTranscriptId: String? = null,
     // Universal Offline AI Provider (com.uoai.provider)
     val uoaiConnection: UoaiConnectionState? = null,
+    val uoaiAudioStatus: UoaiAudioStatusResponse? = null,
+    val uoaiAudioProviders: List<UoaiAudioProviderInfo> = emptyList(),
+    val uoaiAudioModels: List<UoaiAudioModelInfo> = emptyList(),
+    val isManagingUoaiAudioModel: Boolean = false,
     val uoaiNotice: String? = null,
     val streamingAskText: String = ""
 )
@@ -140,6 +154,7 @@ data class PrimaryUiState(
 @OptIn(FlowPreview::class)
 @HiltViewModel
 class PrimaryViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val bleClient: BleClientController,
     private val scanner: BleScannerManager,
     private val permissionManager: PrimaryPermissionManager,
@@ -153,12 +168,15 @@ class PrimaryViewModel @Inject constructor(
     private val audioPlayback: AudioPlaybackHelper,
     private val audioRetentionManager: AudioRetentionManager,
     private val audioExportManager: AudioExportManager,
-    pairedDao: PairedRecorderDao,
+    private val pairedDao: PairedRecorderDao,
     auditDao: CommandAuditDao,
     private val syncedContentDao: SyncedContentDao,
     private val transcriptDao: TranscriptDao,
     private val memoryDao: MemoryDao
 ) : ViewModel() {
+
+    // Scoped high-frequency playback progress flow so only the playing card recomposes (~6 Hz).
+    val playbackProgressFlow: StateFlow<Float> = audioPlayback.playbackProgress
 
     private val _permissions = MutableStateFlow(permissionManager.getSnapshot())
     private val _lastFeedback = MutableStateFlow<CommandFeedback?>(null)
@@ -180,6 +198,7 @@ class PrimaryViewModel @Inject constructor(
     private val _exportingSegmentId = MutableStateFlow<String?>(null)
     private val _lastExportedAudio = MutableStateFlow<ExportedAudioResult?>(null)
     private val _storageNotice = MutableStateFlow<String?>(null)
+    private val _isManagingUoaiAudioModel = MutableStateFlow(false)
 
     private var activeAskJob: Job? = null
     private var memorySearchJob: Job? = null
@@ -209,13 +228,16 @@ class PrimaryViewModel @Inject constructor(
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), SecondMindInsightsSnapshot())
 
-    // Off-main-thread transcript filtering with debounced search input
+    // Off-main-thread transcript filtering + derived audio metadata
     private val filteredSegmentsFlow = combine(
         allSegmentsFlow,
         _searchQuery.debounce(150L),
         _languageFilter
     ) { items, query, langFilter ->
-        filterSegments(items, query, langFilter)
+        val spokenItems = items.filterNot { it.segment.sessionId == "manual_notes" }
+        val spokenIds = spokenItems.mapNotNull { it.transcript?.transcriptId }.toHashSet()
+        val failedCount = spokenItems.count { it.segment.asrStatus == AsrProcessingStatus.FAILED }
+        Triple(filterSegments(spokenItems, query, langFilter), spokenIds, failedCount)
     }
         .flowOn(Dispatchers.Default)
         .distinctUntilChanged()
@@ -244,7 +266,7 @@ class PrimaryViewModel @Inject constructor(
         settingsRepo.settingsFlow,
         syncManager.progress,
         transcriptionCoordinator.progress,
-        combine(audioPlayback.playingSegmentId, audioPlayback.playbackProgress) { id, prog -> id to prog },
+        audioPlayback.playingSegmentId,
         combine(
             _exportingSegmentId,
             _lastExportedAudio,
@@ -253,8 +275,8 @@ class PrimaryViewModel @Inject constructor(
         ) { expId, exp, notice, speechPacks ->
             AudioActionBundle(expId, exp, notice, speechPacks)
         }
-    ) { settings, syncProg, asrProg, (playingId, progress), audioActions ->
-        SyncAsrGroup(settings, syncProg, asrProg, playingId, progress, audioActions)
+    ) { settings, syncProg, asrProg, playingId, audioActions ->
+        SyncAsrGroup(settings, syncProg, asrProg, playingId, 0f, audioActions)
     }
 
     private val contentGroup = combine(
@@ -263,8 +285,8 @@ class PrimaryViewModel @Inject constructor(
         syncedContentDao.observePendingAsrCount(),
         combine(syncedContentDao.observeActiveAudioChunkCount(), syncedContentDao.observeActiveAudioBytes()) { c, b -> c to b },
         combine(_searchQuery, _languageFilter) { q, f -> q to f }
-    ) { filteredItems, totalSynced, pendingAsr, (activeChunks, activeBytes), (query, langFilter) ->
-        ContentGroup(filteredItems, totalSynced, pendingAsr, activeChunks, activeBytes, query, langFilter)
+    ) { (filteredItems, spokenIds, failedCount), totalSynced, pendingAsr, (activeChunks, activeBytes), (query, langFilter) ->
+        ContentGroup(filteredItems, spokenIds, totalSynced, pendingAsr, failedCount, activeChunks, activeBytes, query, langFilter)
     }
 
     private val memoryListsGroup = combine(
@@ -287,6 +309,15 @@ class PrimaryViewModel @Inject constructor(
         MemoryFilterBundle(q, cat, ent, vault, override)
     }
 
+    private val uoaiAudioBundleFlow = combine(
+        uoaiClient.audioStatus,
+        uoaiClient.audioProviders,
+        uoaiClient.audioModels,
+        _isManagingUoaiAudioModel
+    ) { audioStatus, audioProviders, audioModels, managingModel ->
+        UoaiAudioBundle(audioStatus, audioProviders, audioModels, managingModel)
+    }
+
     private val memoryQueryGroup = combine(
         memoryFiltersFlow,
         combine(_latestAskAnswer, _streamingAskText) { ans, stream -> ans to stream },
@@ -295,9 +326,10 @@ class PrimaryViewModel @Inject constructor(
             memoryDao.observeAskAiHistory(30),
             _highlightedTranscriptId,
             uoaiClient.connectionState,
-            _uoaiNotice
-        ) { h, hi, uoaiConn, uoaiNotice ->
-            UoaiHistoryBundle(h, hi, uoaiConn, uoaiNotice)
+            _uoaiNotice,
+            uoaiAudioBundleFlow
+        ) { h, hi, uoaiConn, uoaiNotice, uoaiAudio ->
+            UoaiHistoryBundle(h, hi, uoaiConn, uoaiNotice, uoaiAudio)
         }
     ) { filters, (latestAsk, streamText), (brief, briefBusy), bundle ->
         MemoryQueryGroup(
@@ -306,6 +338,10 @@ class PrimaryViewModel @Inject constructor(
             askHistory = bundle.askHistory,
             highlightedTranscriptId = bundle.highlightedTranscriptId,
             uoaiConnection = bundle.uoaiConnection,
+            uoaiAudioStatus = bundle.uoaiAudio.status,
+            uoaiAudioProviders = bundle.uoaiAudio.providers,
+            uoaiAudioModels = bundle.uoaiAudio.models,
+            isManagingUoaiAudioModel = bundle.uoaiAudio.isManagingModel,
             uoaiNotice = bundle.uoaiNotice,
             streamingAskText = streamText,
             aiBrief = brief,
@@ -380,8 +416,10 @@ class PrimaryViewModel @Inject constructor(
             asrProgress = syncAsr.asrProgress,
             offlineSpeechPacks = syncAsr.audioActions.speechPacks,
             segmentsWithTranscripts = content.items,
+            spokenTranscriptIds = content.spokenTranscriptIds,
             totalSyncedCount = content.totalSynced,
             pendingAsrCount = content.pendingAsr,
+            failedAsrCount = content.failedAsrCount,
             activeAudioChunkCount = content.activeAudioChunkCount,
             activeAudioBytes = content.activeAudioBytes,
             searchQuery = content.query,
@@ -409,6 +447,10 @@ class PrimaryViewModel @Inject constructor(
             askAiHistory = memQuery.askHistory,
             highlightedTranscriptId = memQuery.highlightedTranscriptId,
             uoaiConnection = memQuery.uoaiConnection,
+            uoaiAudioStatus = memQuery.uoaiAudioStatus,
+            uoaiAudioProviders = memQuery.uoaiAudioProviders,
+            uoaiAudioModels = memQuery.uoaiAudioModels,
+            isManagingUoaiAudioModel = memQuery.isManagingUoaiAudioModel,
             uoaiNotice = memQuery.uoaiNotice,
             streamingAskText = memQuery.streamingAskText
         )
@@ -424,8 +466,31 @@ class PrimaryViewModel @Inject constructor(
         viewModelScope.launch {
             bleClient.commandFeedback.collect { fb -> _lastFeedback.value = fb }
         }
+        viewModelScope.launch {
+            audioPlayback.lastError.collect { err ->
+                if (!err.isNullOrBlank()) {
+                    _storageNotice.value = err
+                    audioPlayback.clearError()
+                }
+            }
+        }
         refreshUoaiConnection()
         refreshOfflineSpeechPacks()
+        ensureBackgroundLinkIfNeeded()
+    }
+
+    fun ensureBackgroundLinkIfNeeded() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val paired = pairedDao.getPairedDevice() ?: return@launch
+            if (!permissionManager.hasBlePermissions()) return@launch
+            val settings = settingsRepo.getSettings()
+            if (settings.keepBackgroundLinkAlive) {
+                if (!PrimarySyncService.isServiceRunning) {
+                    PrimarySyncService.start(context)
+                }
+            }
+            bleClient.ensureConnectedToPaired()
+        }
     }
 
     private fun filterSegments(
@@ -434,13 +499,14 @@ class PrimaryViewModel @Inject constructor(
         langFilter: String
     ): List<SegmentWithTranscript> {
         val q = query.trim().lowercase()
-        // Exclude synthetic manual-note anchors from Audio Chunks list unless matched via transcript highlight
         return all.filter { item ->
             if (item.segment.sessionId == "manual_notes") return@filter false
             val langOk = when (langFilter) {
                 "EN" -> item.transcript?.language?.startsWith("en") == true || item.transcript?.language == "hi-en"
                 "HI" -> item.transcript?.language?.startsWith("hi") == true
-                "PENDING" -> item.transcript == null
+                "PENDING" -> item.segment.asrStatus == AsrProcessingStatus.PENDING ||
+                    item.segment.asrStatus == AsrProcessingStatus.PROCESSING
+                "FAILED" -> item.segment.asrStatus == AsrProcessingStatus.FAILED
                 "AUDIO_ONLY" -> !item.segment.audioDeleted
                 else -> true
             }
@@ -465,13 +531,44 @@ class PrimaryViewModel @Inject constructor(
         bleClient.beginPairing(address)
     }
 
-    fun confirmSas() = bleClient.confirmSasAndSavePairing()
+    fun confirmSas() {
+        bleClient.confirmSasAndSavePairing()
+        viewModelScope.launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(500L)
+            if (settingsRepo.getSettings().keepBackgroundLinkAlive) {
+                PrimarySyncService.start(context)
+            }
+        }
+    }
     fun cancelSas() = bleClient.cancelPendingPairing()
-    fun connectPaired() = bleClient.connectToPairedRecorder(autoConnect = false)
-    fun disconnect() = bleClient.disconnect(userInitiated = true)
+    fun connectPaired() {
+        bleClient.connectToPairedRecorder(autoConnect = false)
+        viewModelScope.launch(Dispatchers.IO) {
+            if (settingsRepo.getSettings().keepBackgroundLinkAlive && !PrimarySyncService.isServiceRunning) {
+                PrimarySyncService.start(context)
+            }
+        }
+    }
+    fun disconnect() {
+        PrimarySyncService.stop(context)
+        bleClient.disconnect(userInitiated = true)
+    }
     fun unpair() {
+        PrimarySyncService.stop(context)
         bleClient.unpair()
         viewModelScope.launch { settingsRepo.resetSyncCursor() }
+    }
+
+    /**
+     * Cleanly stops active Primary background sync service, BLE scanning/connections, audio playback,
+     * and Ask AI streaming before switching this device into Secondary Recorder mode.
+     */
+    fun prepareForRoleSwitch() {
+        PrimarySyncService.stop(context)
+        scanner.stopScan()
+        bleClient.disconnect(userInitiated = true)
+        audioPlayback.stop()
+        stopAskAi()
     }
 
     fun startRecording() = bleClient.startRecording()
@@ -488,6 +585,10 @@ class PrimaryViewModel @Inject constructor(
     fun setConfig(cfg: RecorderConfigPayload) = bleClient.setConfig(cfg)
     fun setLocalOnlyPauseSync(paused: Boolean) = bleClient.setLocalOnlyPauseSync(paused)
     fun clearFeedback() { _lastFeedback.value = null }
+    fun clearLastError() {
+        scanner.clearError()
+        bleClient.clearError()
+    }
 
     fun setSearchQuery(q: String) { _searchQuery.value = q }
     fun setLanguageFilter(filter: String) { _languageFilter.value = filter }
@@ -522,7 +623,9 @@ class PrimaryViewModel @Inject constructor(
             settingsRepo.setAudioRetentionPolicy(policy)
             val report = audioRetentionManager.enforceRetentionPolicy()
             _storageNotice.value = if (report.deletedChunks > 0) {
-                "Policy set to ${policy.shortLabel} • Pruned ${report.deletedChunks} old audio chunk(s) (${formatBytesMb(report.freedBytes)} freed; transcripts kept)."
+                "Policy set to ${policy.shortLabel} • Pruned ${report.deletedChunks} verified audio chunk(s) (${formatBytesMb(report.freedBytes)} freed; transcripts kept)."
+            } else if (policy.isImmediateAfterTranscription) {
+                "Auto-delete set to After ASR. Verified audio chunks are deleted immediately after transcription; failed/inaudible clips stay preserved."
             } else {
                 "Auto-delete policy set to ${policy.displayName}. Transcripts & memories are always preserved."
             }
@@ -533,9 +636,11 @@ class PrimaryViewModel @Inject constructor(
         viewModelScope.launch(Dispatchers.IO) {
             val report = audioRetentionManager.enforceRetentionPolicy()
             _storageNotice.value = if (report.deletedChunks > 0) {
-                "Cleaned ${report.deletedChunks} expired audio chunk(s), freed ${formatBytesMb(report.freedBytes)}. Transcripts kept intact."
+                "Cleaned ${report.deletedChunks} verified audio chunk(s), freed ${formatBytesMb(report.freedBytes)}. Transcripts kept intact."
+            } else if (report.policy == AudioRetentionPolicy.KEEP_FOREVER) {
+                "Policy is Keep All — choose After ASR, an hourly/daily window, or delete individual chunks."
             } else {
-                "No completed audio chunks older than ${report.policy.shortLabel} to clean."
+                "No verified transcribed audio chunks eligible under ${report.policy.shortLabel} policy."
             }
         }
     }
@@ -655,7 +760,7 @@ class PrimaryViewModel @Inject constructor(
         viewModelScope.launch(Dispatchers.IO) {
             memoryCoordinator.captureManualMemory(title, content, category, pin, createTask)
                 .onSuccess {
-                    _storageNotice.value = "Saved thought to your 2nd Mind Vault."
+                    _storageNotice.value = "Saved thought to your Sunbo 2nd Mind Vault."
                 }
                 .onFailure { err ->
                     _storageNotice.value = "Could not save note: ${err.message}"
@@ -717,6 +822,11 @@ class PrimaryViewModel @Inject constructor(
             is UoaiRegistrationResult.Approved -> {
                 _uoaiNotice.value = null
                 refreshUoaiConnection()
+                viewModelScope.launch(Dispatchers.IO) {
+                    if (settingsRepo.getSettings().asrProviderType == AsrProviderType.UOAI_PROVIDER) {
+                        transcriptionCoordinator.enqueuePendingProcessing()
+                    }
+                }
             }
             is UoaiRegistrationResult.Denied -> {
                 _uoaiNotice.value = "UOAI access denied (${res.errorCode}): ${res.message}"
@@ -745,16 +855,88 @@ class PrimaryViewModel @Inject constructor(
         }
     }
 
+    fun createManualTask(title: String, notes: String, dueLabel: String?, priority: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            memoryCoordinator.createManualTask(title, notes, dueLabel, priority)
+                .onSuccess { _storageNotice.value = "Added \"${it.title.take(36)}\" to Tasks." }
+                .onFailure { _storageNotice.value = "Could not add task: ${it.message}" }
+        }
+    }
+
+    fun editTask(task: TaskReminderEntity, title: String, notes: String, dueLabel: String?, priority: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            memoryCoordinator.editTask(task, title, notes, dueLabel, priority)
+            _storageNotice.value = "Updated task \"${title.trim().take(36)}\"."
+        }
+    }
+
     fun highlightTranscript(transcriptId: String?) {
         _highlightedTranscriptId.value = transcriptId
     }
 
     // Settings (100% On-Device / Loopback Privacy Only)
-    fun setAsrProvider(type: AsrProviderType) { viewModelScope.launch { settingsRepo.setAsrProvider(type) } }
+    fun setAsrProvider(type: AsrProviderType) {
+        viewModelScope.launch {
+            settingsRepo.setAsrProvider(type)
+            if (type == AsrProviderType.UOAI_PROVIDER) {
+                refreshUoaiConnection()
+            }
+        }
+    }
     fun setAsrLanguage(mode: AsrLanguageMode) { viewModelScope.launch { settingsRepo.setAsrLanguage(mode) } }
+    fun setUoaiAsrProviderId(providerId: String) {
+        viewModelScope.launch {
+            settingsRepo.setUoaiAsrProviderId(providerId)
+            refreshUoaiConnection()
+        }
+    }
+    fun setUoaiAsrModel(model: String) { viewModelScope.launch { settingsRepo.setUoaiAsrModel(model) } }
+    fun setUoaiAsrScript(script: UoaiAsrScript) { viewModelScope.launch { settingsRepo.setUoaiAsrScript(script) } }
+
+    fun loadUoaiAudioModel(model: String) {
+        if (_isManagingUoaiAudioModel.value) return
+        viewModelScope.launch(Dispatchers.IO) {
+            _isManagingUoaiAudioModel.value = true
+            uoaiClient.loadAudioModel(model)
+                .onSuccess { msg -> _storageNotice.value = msg }
+                .onFailure { err ->
+                    _storageNotice.value = if (err is com.personalai.primary.memory.uoai.UoaiException.PermissionDenied) {
+                        "Missing 'asr_model_control' permission in UOAI Provider → Clients. Load the model directly inside UOAI Provider or enable asr_model_control."
+                    } else {
+                        "Could not load UOAI audio model: ${err.message}"
+                    }
+                }
+            _isManagingUoaiAudioModel.value = false
+        }
+    }
+
+    fun unloadUoaiAudioModels() {
+        if (_isManagingUoaiAudioModel.value) return
+        viewModelScope.launch(Dispatchers.IO) {
+            _isManagingUoaiAudioModel.value = true
+            uoaiClient.unloadAudioModel(force = false)
+                .onSuccess { msg -> _storageNotice.value = msg }
+                .onFailure { err ->
+                    _storageNotice.value = "Could not unload UOAI audio models: ${err.message}"
+                }
+            _isManagingUoaiAudioModel.value = false
+        }
+    }
     fun setLlmProvider(type: LlmProviderType) { viewModelScope.launch { settingsRepo.setLlmProvider(type) } }
     fun setAutoExtractMemory(enabled: Boolean) { viewModelScope.launch { settingsRepo.setAutoExtractMemory(enabled) } }
     fun setLocalWhisperUrl(url: String) { viewModelScope.launch { settingsRepo.setLocalWhisperUrl(url) } }
+    fun setKeepBackgroundLinkAlive(enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            settingsRepo.setKeepBackgroundLinkAlive(enabled)
+            if (enabled) {
+                if (pairedDao.getPairedDevice() != null && permissionManager.hasBlePermissions()) {
+                    PrimarySyncService.start(context)
+                }
+            } else {
+                PrimarySyncService.stop(context)
+            }
+        }
+    }
     fun setAutoSyncOnReconnect(enabled: Boolean) { viewModelScope.launch { settingsRepo.setAutoSyncOnReconnect(enabled) } }
     fun setAutoTranscribeSynced(enabled: Boolean) { viewModelScope.launch { settingsRepo.setAutoTranscribeSynced(enabled) } }
 
@@ -824,8 +1006,10 @@ class PrimaryViewModel @Inject constructor(
 
     private data class ContentGroup(
         val items: List<SegmentWithTranscript>,
+        val spokenTranscriptIds: Set<String>,
         val totalSynced: Int,
         val pendingAsr: Int,
+        val failedAsrCount: Int,
         val activeAudioChunkCount: Int,
         val activeAudioBytes: Long,
         val query: String,
@@ -849,11 +1033,19 @@ class PrimaryViewModel @Inject constructor(
         val searchOverride: List<MemoryItemEntity>?
     )
 
+    private data class UoaiAudioBundle(
+        val status: UoaiAudioStatusResponse?,
+        val providers: List<UoaiAudioProviderInfo>,
+        val models: List<UoaiAudioModelInfo>,
+        val isManagingModel: Boolean
+    )
+
     private data class UoaiHistoryBundle(
         val askHistory: List<AskAiAuditEntity>,
         val highlightedTranscriptId: String?,
         val uoaiConnection: UoaiConnectionState?,
-        val uoaiNotice: String?
+        val uoaiNotice: String?,
+        val uoaiAudio: UoaiAudioBundle
     )
 
     private data class MemoryQueryGroup(
@@ -862,6 +1054,10 @@ class PrimaryViewModel @Inject constructor(
         val askHistory: List<AskAiAuditEntity>,
         val highlightedTranscriptId: String?,
         val uoaiConnection: UoaiConnectionState?,
+        val uoaiAudioStatus: UoaiAudioStatusResponse?,
+        val uoaiAudioProviders: List<UoaiAudioProviderInfo>,
+        val uoaiAudioModels: List<UoaiAudioModelInfo>,
+        val isManagingUoaiAudioModel: Boolean,
         val uoaiNotice: String?,
         val streamingAskText: String,
         val aiBrief: String?,
